@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from fallback import pick_scalar
 from kernels import Matmul, autotune_matmul, matmul_reference
 from vk import Device
 
@@ -17,7 +18,10 @@ def _run_case(dev, m, n, k, sg, wm, wn, trans_a=False, trans_b=False, seed=0):
     ba = dev.buffer(a.size * 2, "shared")
     bb = dev.buffer(b.size * 2, "shared")
     bc = dev.buffer(m * n * 4, "cached")
-    mm = Matmul(dev, sg, wm, wn, trans_a, trans_b)
+    # Fall back automatically when the device has no usable matrix units, so
+    # the same cases cover both paths.
+    mm = (Matmul(dev, sg, wm, wn, trans_a, trans_b) if dev.has_coop_matrix
+          else pick_scalar(dev, m, n, k, trans_a, trans_b))
     try:
         ba.array(np.float16, a_shape)[:] = a
         bb.array(np.float16, b_shape)[:] = b
@@ -75,7 +79,8 @@ def test_accumulate_is_f32(dev):
     ba = dev.buffer(a.size * 2, "shared")
     bb = dev.buffer(b.size * 2, "shared")
     bc = dev.buffer(m * n * 4, "cached")
-    mm = Matmul(dev, 1, 2, 2)
+    mm = (Matmul(dev, 1, 2, 2) if dev.has_coop_matrix
+          else pick_scalar(dev, m, n, k))
     try:
         ba.array(np.float16, a.shape)[:] = a
         bb.array(np.float16, b.shape)[:] = b
@@ -96,6 +101,9 @@ def test_accumulate_is_f32(dev):
 
 
 def test_autotune(dev):
+    if not dev.has_coop_matrix:
+        print("  autotune                             skipped (scalar path)")
+        return
     mm, best = autotune_matmul(dev, 512, 512, 512, verbose=True, use_cache=False)
     try:
         print(f"  best config sg={best['config'][0]} wm={best['config'][1]} "

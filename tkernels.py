@@ -16,6 +16,11 @@ from kernels import Elementwise
 
 def make_transformer_kernels(dev):
     K = {}
+    # Row kernels stride a row across one subgroup's lanes, so the stride must
+    # equal the real subgroup width. dev.row_subgroup_size is 32 where the
+    # device will grant it and the native width otherwise.
+    W = dev.row_subgroup_size
+    RS = dev.row_subgroup_size if dev.can_set_subgroup_size else None
 
     # ---- LayerNorm ------------------------------------------------------
     # One invocation per row. Saves mu and rstd so backward need not recompute.
@@ -34,18 +39,19 @@ def make_transformer_kernels(dev):
         uint lane = gl_SubgroupInvocationID;
         uint base = row * p.D;
         float s = 0.0;
-        for (uint d = lane; d < p.D; d += 32u) s += x[base + d];
+        for (uint d = lane; d < p.D; d += SUBWu) s += x[base + d];
         float m = subgroupAdd(s) / float(p.D);
         float v = 0.0;
-        for (uint d = lane; d < p.D; d += 32u) { float t = x[base + d] - m; v += t * t; }
+        for (uint d = lane; d < p.D; d += SUBWu) { float t = x[base + d] - m; v += t * t; }
         float r = inversesqrt(subgroupAdd(v) / float(p.D) + 1e-5);
         if (lane == 0u) { mu[row] = m; rstd[row] = r; }
-        for (uint d = lane; d < p.D; d += 32u) {
+        for (uint d = lane; d < p.D; d += SUBWu) {
             float xh = (x[base + d] - m) * r;
             y16[base + d] = float16_t(xh * gamma[d] + beta[d]);
         }
         """,
-        push=[("D", "uint")], local=32, subgroup_size=32, extensions=SUBGROUP)
+        push=[("D", "uint")], local=W, subgroup_size=RS, extensions=SUBGROUP,
+        width=W)
 
     # dx needs both row means; dgamma/dbeta are column sums done separately,
     # so this also emits dy*xhat for that reduction.
@@ -61,7 +67,7 @@ def make_transformer_kernels(dev):
         uint base = row * p.D;
         float m = mu[row], r = rstd[row];
         float sum_dxh = 0.0, sum_dxh_xh = 0.0;
-        for (uint d = lane; d < p.D; d += 32u) {
+        for (uint d = lane; d < p.D; d += SUBWu) {
             float xh = (x[base + d] - m) * r;
             float dxh = dy[base + d] * gamma[d];
             sum_dxh += dxh;
@@ -72,13 +78,14 @@ def make_transformer_kernels(dev):
         sum_dxh = subgroupAdd(sum_dxh);
         sum_dxh_xh = subgroupAdd(sum_dxh_xh);
         float inv = 1.0 / float(p.D);
-        for (uint d = lane; d < p.D; d += 32u) {
+        for (uint d = lane; d < p.D; d += SUBWu) {
             float xh = (x[base + d] - m) * r;
             float dxh = dy[base + d] * gamma[d];
             dx[base + d] = r * (dxh - sum_dxh * inv - xh * sum_dxh_xh * inv);
         }
         """,
-        push=[("D", "uint")], local=32, subgroup_size=32, extensions=SUBGROUP)
+        push=[("D", "uint")], local=W, subgroup_size=RS, extensions=SUBGROUP,
+        width=W)
 
     # ---- Attention softmax ----------------------------------------------
     # One invocation per (batch*head*query) row. Scale, causal mask, max
@@ -104,20 +111,20 @@ def make_transformer_kernels(dev):
         uint base = row * p.T;
         uint q = row % p.T;
         float mx = -1e30;
-        for (uint j = lane; j <= q; j += 32u) mx = max(mx, s[base + j] * p.scale);
+        for (uint j = lane; j <= q; j += SUBWu) mx = max(mx, s[base + j] * p.scale);
         mx = subgroupMax(mx);
         float sum = 0.0;
-        for (uint j = lane; j <= q; j += 32u) sum += exp(s[base + j] * p.scale - mx);
+        for (uint j = lane; j <= q; j += SUBWu) sum += exp(s[base + j] * p.scale - mx);
         sum = subgroupAdd(sum);
         float inv = 1.0 / sum;
-        for (uint j = lane; j < p.T; j += 32u) {
+        for (uint j = lane; j < p.T; j += SUBWu) {
             float v = 0.0;
             if (j <= q) v = exp(s[base + j] * p.scale - mx) * inv;
             p16[base + j] = float16_t(v);
         }
         """,
         push=[("T", "uint"), ("scale", "float")],
-        local=32, subgroup_size=32,
+        local=W, subgroup_size=RS, width=W,
         extensions=["GL_KHR_shader_subgroup_basic", "GL_KHR_shader_subgroup_arithmetic"])
 
     # dS = P * (dP - sum_j dP_j P_j), same scale, same mask.
@@ -134,17 +141,17 @@ def make_transformer_kernels(dev):
         uint base = row * p.T;
         uint q = row % p.T;
         float dot = 0.0;
-        for (uint j = lane; j <= q; j += 32u)
+        for (uint j = lane; j <= q; j += SUBWu)
             dot += dp[base + j] * float(p16[base + j]);
         dot = subgroupAdd(dot);
-        for (uint j = lane; j < p.T; j += 32u) {
+        for (uint j = lane; j < p.T; j += SUBWu) {
             float v = 0.0;
             if (j <= q) v = float(p16[base + j]) * (dp[base + j] - dot) * p.scale;
             ds16[base + j] = float16_t(v);
         }
         """,
         push=[("T", "uint"), ("scale", "float")],
-        local=32, subgroup_size=32,
+        local=W, subgroup_size=RS, width=W,
         extensions=["GL_KHR_shader_subgroup_basic", "GL_KHR_shader_subgroup_arithmetic"])
 
     # ---- Head permutes ---------------------------------------------------

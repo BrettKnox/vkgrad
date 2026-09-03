@@ -620,7 +620,11 @@ class Elementwise:
     """A compiled elementwise kernel plus its dispatch arithmetic."""
 
     def __init__(self, dev, name, bufs, body, push=(), local=256, extensions=(),
-                 subgroup_size=None):
+                 subgroup_size=None, width=None):
+        # SUBWu in a body stands for the negotiated subgroup width. It cannot be
+        # a format placeholder: GLSL bodies contain braces and '%'.
+        if width is not None:
+            body = body.replace("SUBWu", f"{width}u")
         self.dev = dev
         self.name = name
         self.local = local

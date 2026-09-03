@@ -76,6 +76,10 @@ def test_zero_copy_roundtrip(dev):
 
 
 def test_wave32(dev):
+    if not dev.can_set_subgroup_size:
+        print(f"  required subgroup size      unavailable, kernels use "
+              f"native width {dev.subgroup_size_native}")
+        return
     lo, hi, stages = dev.subgroup_size_range()
     assert stages & 0x20, "requiredSubgroupSize not supported for compute stage"
     assert lo <= 32 <= hi, f"32 outside subgroup range [{lo},{hi}]"
@@ -98,6 +102,9 @@ def test_wave32(dev):
 
 def test_coop_matrix(dev):
     """16x16x16 f16 x f16 -> f32 on the matrix cores, checked against numpy."""
+    if not dev.has_coop_matrix:
+        print("  cooperative matrix          unavailable, scalar path in use")
+        return
     cfgs = [c for c in dev.coop_matrix_configs()
             if c["A"] == "f16" and c["C"] == "f32" and c["scope"] == "subgroup"]
     assert cfgs, "no f16->f32 subgroup cooperative matrix config"

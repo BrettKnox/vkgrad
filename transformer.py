@@ -57,7 +57,7 @@ class LayerNorm:
         self.x32 = x32
         self.ctx.TK["layernorm"](
             [x32, self.g.w32, self.b.w32, self.y16, self.mu, self.rstd],
-            self.rows * 32, self.D, graph=graph)
+            self.rows * self.ctx.dev.row_subgroup_size, self.D, graph=graph)
         return self.y16
 
     def backward(self, dy32, graph=None):
@@ -65,7 +65,7 @@ class LayerNorm:
         c.TK["layernorm_bwd"](
             [dy32, self.x32, self.g.w32, self.mu, self.rstd, self.dx,
              self.dyxh, self.dy16],
-            self.rows * 32, self.D, graph=graph)
+            self.rows * self.ctx.dev.row_subgroup_size, self.D, graph=graph)
         c.col_sum(self.dyxh, self.g.g32, self.D, self.rows, graph=graph)
         c.col_sum(self.dy16, self.b.g32, self.D, self.rows, graph=graph)
         return self.dx
@@ -145,7 +145,7 @@ class Attention:
             self.q16, self.k16, self.scores, T, T, hd, graph=graph,
             nbatch=self.nbh, strides=(T * hd, T * hd, T * T))
         TK["attn_softmax"]([self.scores, self.p16],
-                           self.nbh * T * 32, T, self.scale, graph=graph)
+                           self.nbh * T * c.dev.row_subgroup_size, T, self.scale, graph=graph)
         c.matmul(T, hd, T, batched=True, nbatch=self.nbh)(
             self.p16, self.v16, self.ao32, T, hd, T, graph=graph,
             nbatch=self.nbh, strides=(T * T, T * hd, T * hd))
@@ -168,7 +168,7 @@ class Attention:
             self.dao16, self.v16, self.dp32, T, T, hd, graph=graph,
             nbatch=self.nbh, strides=(T * hd, T * hd, T * T))
         TK["attn_softmax_bwd"]([self.dp32, self.p16, self.ds16],
-                               self.nbh * T * 32, T, self.scale, graph=graph)
+                               self.nbh * T * c.dev.row_subgroup_size, T, self.scale, graph=graph)
         # dQ = dS @ K, dK = dS^T @ Q
         c.matmul(T, hd, T, batched=True, nbatch=self.nbh)(
             self.ds16, self.k16, self.dq32, T, hd, T, graph=graph,

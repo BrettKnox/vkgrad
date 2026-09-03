@@ -861,3 +861,51 @@ This is the second time a portability claim in this document did not survive
 being checked. The general lesson is the same one as the measurement sections:
 claims about behaviour on hardware you have not run on need a mechanism that
 makes them true, not an assumption that they are.
+
+
+## 37. Subgroup width was a silent-wrong-answer bug on non-AMD hardware
+
+The row-reduction kernels (LayerNorm, attention softmax) stride a row across the
+lanes of one subgroup. The stride must equal the real subgroup width. It was
+hardcoded to 32, alongside a `requiredSubgroupSize=32` request that AMD happens
+to grant.
+
+Deliberately mismatching stride and width, summing 192 floats per row:
+
+| workgroup | stride | required size | result |
+|---|---|---|---|
+| 32 | 32 | 32 | exact |
+| 64 | 32 | none | **84% error** |
+| 64 | 64 | 64 | exact |
+
+Not a crash. Wrong sums, silently. That would have hit Intel (subgroup width
+commonly 8, 16 or 32), older AMD at wave64, and anything without
+`subgroupSizeControl`, where the request is simply not honoured.
+
+The runtime now negotiates: it reads the native subgroup width, uses 32 when the
+device will grant it and the native width otherwise, and generates the row
+kernels for whatever width was chosen. Two further bugs surfaced while testing
+that path:
+
+- The dispatch multiplier was also hardcoded to 32, so at width 64 only half
+  the rows were processed.
+- Cooperative matrix kernels assume `local_size = sg*32` tiled by
+  `gl_SubgroupID`. Without a 32-wide subgroup that tiling mis-indexes, so
+  cooperative matrix is now gated on the device being natively 32 wide (NVIDIA,
+  Intel) or granting 32 on request (AMD). Otherwise the scalar path is used.
+
+`VKGRAD_NATIVE_SUBGROUP=1` simulates a device that cannot set subgroup size, so
+the adaptive path is exercised on hardware that does not need it. All five
+suites now pass in four configurations:
+
+| configuration | approximates | result |
+|---|---|---|
+| default | RDNA3: coopmat, wave32 | pass |
+| `VKGRAD_NO_COOPMAT=1` | Vega, Pascal, pre-Arc Intel | pass |
+| `VKGRAD_NATIVE_SUBGROUP=1` | no subgroup size control, wave64 | pass |
+| both | oldest supported tier | pass |
+
+Third portability claim in this document that did not survive being checked. The
+pattern is now unambiguous: every assumption about hardware not physically
+present has been wrong, and the only thing that has ever caught it is building a
+way to run the other configuration.

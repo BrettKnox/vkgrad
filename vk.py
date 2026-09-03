@@ -41,6 +41,7 @@ ST_PHYS_VULKAN_12_FEATURES = 51
 ST_PHYS_VULKAN_13_FEATURES = 53
 ST_PHYS_FEATURES_2 = 1000059000
 ST_PHYS_PROPERTIES_2 = 1000059001
+ST_PHYS_SUBGROUP_PROPERTIES = 1000094000
 ST_PHYS_SUBGROUP_SIZE_CONTROL_PROPS = 1000225000
 ST_REQUIRED_SUBGROUP_SIZE_CI = 1000225001
 ST_PHYS_COOP_MATRIX_FEATURES_KHR = 1000506000
@@ -270,6 +271,13 @@ class PipelineExecutableStatistic(C.Structure):
     _fields_ = [("sType", C.c_uint32), ("pNext", C.c_void_p),
                 ("name", C.c_char * 256), ("description", C.c_char * 256),
                 ("format", C.c_uint32), ("value", _StatValue)]
+
+
+class SubgroupProps(C.Structure):
+    _fields_ = [("sType", C.c_uint32), ("pNext", C.c_void_p),
+                ("subgroupSize", C.c_uint32), ("supportedStages", C.c_uint32),
+                ("supportedOperations", C.c_uint32),
+                ("quadOperationsInAllStages", C.c_uint32)]
 
 
 class SubgroupSizeControlProps(C.Structure):
@@ -629,6 +637,8 @@ class Kernel:
 
         stage_flags = 0
         pnext = None
+        if subgroup_size is not None and not dev.can_set_subgroup_size:
+            subgroup_size = None   # device cannot honour it; kernels adapt instead
         if subgroup_size is not None:
             rss = RequiredSubgroupSizeCI(ST_REQUIRED_SUBGROUP_SIZE_CI, None, subgroup_size)
             pnext = C.cast(C.pointer(rss), C.c_void_p)
@@ -839,6 +849,7 @@ class Device:
         self._create_instance(validate)
         self._pick_physical()
         self._create_device()
+        self._init_subgroup_plan()
         self._create_pools()
 
     # -- setup ------------------------------------------------------------
@@ -1026,6 +1037,38 @@ class Device:
                "vkCreateFence")
 
     # -- queries ----------------------------------------------------------
+
+    def _init_subgroup_plan(self):
+        """Decide the width row-reduction kernels will be generated for.
+
+        Kernels that stride a row across the lanes of one subgroup must use a
+        stride equal to the actual subgroup size. A mismatch does not crash, it
+        silently returns wrong sums (measured: 84% error), so the width has to
+        be negotiated rather than assumed. Prefer 32 where the device will grant
+        it, otherwise generate for whatever the device natively uses.
+        """
+        props = SubgroupProps(ST_PHYS_SUBGROUP_PROPERTIES, None)
+        head = Properties2Head(ST_PHYS_PROPERTIES_2, C.cast(C.pointer(props), C.c_void_p))
+        _lib.vkGetPhysicalDeviceProperties2(self.phys, C.byref(head))
+        self.subgroup_size_native = int(props.subgroupSize) or 32
+        lo, hi, stages = self.subgroup_size_range()
+        can_set = (self.features.get("subgroupSizeControl", False)
+                   and bool(stages & STAGE_COMPUTE) and lo <= 32 <= hi)
+        # Simulate a device without subgroup size control (older AMD at wave64,
+        # Intel at 8/16, anything pre-Vulkan-1.3) to exercise the adaptive path.
+        if os.environ.get("VKGRAD_NATIVE_SUBGROUP") == "1":
+            can_set = False
+        self.can_set_subgroup_size = can_set
+        self.row_subgroup_size = 32 if can_set else self.subgroup_size_native
+        # The cooperative-matrix kernels are generated for 32-wide subgroups
+        # (local_size = sg*32, tiled by gl_SubgroupID). That is only valid if
+        # the device is natively 32 wide or will grant 32 on request; otherwise
+        # the subgroup tiling would silently mis-index and the scalar path is
+        # used instead.
+        self.coopmat_wave32_ok = can_set or self.subgroup_size_native == 32
+        if self.has_coop_matrix and not self.coopmat_wave32_ok:
+            self.has_coop_matrix = False
+            self.features["cooperativeMatrix"] = False
 
     def subgroup_size_range(self):
         props = SubgroupSizeControlProps(ST_PHYS_SUBGROUP_SIZE_CONTROL_PROPS, None)
