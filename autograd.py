@@ -100,7 +100,12 @@ class Param:
         self.n = int(np.prod(shape))
         self.name = name
         self.no_decay = no_decay
-        self.w32 = ctx.buf(self.n * 4, "shared")
+        # host-CACHED, not host-coherent-only: the CPU reads master weights
+        # (checkpointing, gradient checks, and any CPU worker in a
+        # heterogeneous job), and CPU reads from write-combined memory run at
+        # 0.32 GB/s against 23.30 GB/s cached, a factor of 73. The GPU pays
+        # about 2% on its own reads for that.
+        self.w32 = ctx.buf(self.n * 4, "cached")
         self.w16 = ctx.buf(self.n * 2, "device")
         self.g32 = ctx.buf(self.n * 4, "device")
         self.m = ctx.zeros(self.n)

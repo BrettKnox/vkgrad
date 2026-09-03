@@ -720,3 +720,67 @@ Scope note: these run two VkDevices from the one physical GPU available here.
 That validates the mechanism (independent devices, independent queues, one
 shared allocation, writes visible both ways). It does not demonstrate two
 vendors, which needs hardware this machine does not have.
+
+
+## 33. CPU reads from write-combined memory are 73x slower
+
+Found by trying to add a CPU worker to a training job. 1 MiB of f32, CPU side:
+
+| memory kind | CPU read | CPU write |
+|---|---|---|
+| `shared` (HOST_VISIBLE + COHERENT, write-combined) | **0.32 GB/s** | 43.69 GB/s |
+| `cached` (+ HOST_CACHED) | **23.30 GB/s** | 117.82 GB/s |
+| `bar` (DEVICE_LOCAL + HOST_VISIBLE) | **0.06 GB/s** | 10.00 GB/s |
+| ordinary numpy array, for scale | 23.51 GB/s | |
+
+Write-combined memory reads at 1/73rd of normal memory, and the small BAR
+window at 1/390th. The GPU pays only ~2% for host-cached (67.18 vs 68.70 GB/s),
+so for anything the CPU reads, `cached` is strictly the right choice.
+
+Section 3 said exactly this, and the code then put master weights in `shared`
+anyway. A latent bug that only heterogeneous work exposed. `Param.w32` is now
+`cached`, which left GPU-only training unchanged.
+
+## 34. Heterogeneous CPU + GPU pooling does not pay on an APU
+
+The gradient arena is ordinary host memory, so a numpy worker joins with no
+plumbing: it adds into the same array the GPU atomically adds into, and reads
+weights straight out of host-visible memory. No copies in either direction.
+
+Three things had to be fixed before the measurement meant anything, each worth
+recording on its own:
+
+1. **Weights in `cached`, not `shared`** (section 33), or the worker spends
+   3.1 ms per parameter just reading them.
+2. **The GPU step must be one recorded submit.** Every ctypes call takes the
+   GIL and a numpy thread holds it in 5 ms slices, so ~23 eager dispatches and
+   a CPU worker starve each other. One submit blocks inside `vkWaitForFences`
+   with the GIL released. This alone took GPU-only from 66,545 to 206,228
+   samples/s.
+3. **A persistent worker thread.** OpenBLAS builds its thread team per calling
+   thread, so spawning a fresh thread each step pays that setup every time and
+   turns a 0.8 ms shard into 18 ms.
+
+With all three fixed, MNIST, global batch 256:
+
+| CPU share | split | samples/s | vs GPU only |
+|---|---|---|---|
+| 0 | 256+0 | 206,228 | 1.00x |
+| 0.125 | 224+32 | 157,398 | 0.76x |
+| 0.25 | 192+64 | 109,249 | 0.53x |
+| 0.375 | 160+96 | 84,729 | 0.41x |
+| 0.5 | 128+128 | 72,763 | 0.35x |
+
+**Monotonically worse.** The arithmetic shows why: the GPU alone does 256
+samples in 1.24 ms and the CPU does 32 in 0.83 ms, so perfect overlap would
+give ~235,000 samples/s, a small gain. Measured is 157,398, meaning the GPU step
+got about 50% slower while the CPU contributed 14% more samples.
+
+That is DRAM contention. The GPU is already at the memory ceiling (section 27),
+so a CPU worker on the same controller takes bandwidth directly out of it.
+
+This sharpens rather than weakens the multi-device case. The reason to pool
+devices is *separate memory systems*. Two workers behind one memory controller
+share the bottleneck and cannot win. A discrete GPU brings its own VRAM and its
+own controller, which is exactly the configuration the shared-arena collective
+of section 32 targets.
