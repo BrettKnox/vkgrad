@@ -1,0 +1,14 @@
+# Datasets: not ours to redistribute. examples/mnist.py says where to get them.
+data/
+
+# Machine-specific artefacts.
+.spv_cache/
+.autotune.json
+bench/*.json
+scratch/
+
+# Benchmark run output: contains hostname, username and a process list.
+bench/runs/
+
+__pycache__/
+*.pyc
