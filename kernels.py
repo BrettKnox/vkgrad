@@ -30,7 +30,7 @@ _COL = "gl_CooperativeMatrixLayoutColumnMajor"
 
 
 def matmul_glsl(sg=4, wm=2, wn=2, trans_a=False, trans_b=False, batched=False,
-                acc16=False):
+                acc16=False, group_m=0):
     """C[MxN] = A @ B with f16 inputs and f32 accumulation.
 
     sg  subgroups per workgroup (each is one wave32)
@@ -69,8 +69,32 @@ def matmul_glsl(sg=4, wm=2, wn=2, trans_a=False, trans_b=False, batched=False,
                % ("float16_t" if acc16 else "float"))
     src.append("")
     src.append("void main() {")
-    src.append(f"    uint row0 = gl_WorkGroupID.x * {bm}u + gl_SubgroupID * {wm * TILE}u;")
-    src.append(f"    uint col0 = gl_WorkGroupID.y * {bn}u;")
+    if group_m:
+        # L2-aware workgroup ordering.
+        #
+        # With the natural 2D grid, consecutive workgroups sweep one axis of C
+        # and every one of them pulls a fresh operand block from DRAM. Grouping
+        # the launch so that a band of `group_m` row-blocks is finished across
+        # all column-blocks before moving on keeps that band's A rows, and all
+        # of B, resident in L2 across the whole band. Same work, same tiles,
+        # different visit order.
+        #
+        # This is the Triton/CUTLASS grouped rasterisation, expressed against a
+        # flat 1D dispatch so the driver's launch order is the traversal order.
+        src.append(f"    uint num_m = (p.M + {bm}u - 1u) / {bm}u;")
+        src.append(f"    uint num_n = (p.N + {bn}u - 1u) / {bn}u;")
+        src.append("    uint pid = gl_WorkGroupID.x;")
+        src.append(f"    uint in_group = {group_m}u * num_n;")
+        src.append("    uint gid = pid / in_group;")
+        src.append(f"    uint first_m = gid * {group_m}u;")
+        src.append(f"    uint gsize = min(num_m - first_m, {group_m}u);")
+        src.append("    uint pid_m = first_m + ((pid % in_group) % gsize);")
+        src.append("    uint pid_n = (pid % in_group) / gsize;")
+        src.append(f"    uint row0 = pid_m * {bm}u + gl_SubgroupID * {wm * TILE}u;")
+        src.append(f"    uint col0 = pid_n * {bn}u;")
+    else:
+        src.append(f"    uint row0 = gl_WorkGroupID.x * {bm}u + gl_SubgroupID * {wm * TILE}u;")
+        src.append(f"    uint col0 = gl_WorkGroupID.y * {bn}u;")
     if batched:
         src.append("    uint oa = gl_WorkGroupID.z * p.sa;")
         src.append("    uint ob = gl_WorkGroupID.z * p.sb;")
@@ -210,12 +234,13 @@ class Matmul:
 
     def __init__(self, dev, sg=4, wm=2, wn=2, trans_a=False, trans_b=False,
                  capture_stats=False, lds=False, bk=32, batched=False,
-                 acc16=False):
+                 acc16=False, group_m=0):
         self.dev = dev
         self.sg, self.wm, self.wn = sg, wm, wn
         self.trans_a, self.trans_b = trans_a, trans_b
         self.lds, self.bk, self.batched = lds, bk, batched
         self.acc16 = acc16
+        self.group_m = group_m
         self.bm = sg * wm * TILE
         self.bn = wn * TILE
         if lds:
@@ -224,10 +249,12 @@ class Matmul:
             self.src = matmul_lds_glsl(sg, wm, wn, bk)
             name = f"mmlds_sg{sg}_wm{wm}_wn{wn}_bk{bk}"
         else:
-            self.src = matmul_glsl(sg, wm, wn, trans_a, trans_b, batched, acc16)
+            self.src = matmul_glsl(sg, wm, wn, trans_a, trans_b, batched, acc16,
+                                   group_m)
             name = (f"mm_sg{sg}_wm{wm}_wn{wn}"
                     f"{'_ta' if trans_a else ''}{'_tb' if trans_b else ''}"
-                    f"{'_bat' if batched else ''}{'_a16' if acc16 else ''}")
+                    f"{'_bat' if batched else ''}{'_a16' if acc16 else ''}"
+                    f"{'_g' + str(group_m) if group_m else ''}")
         self.name = name
         self.push_size = 24 if batched else 12
         spv = compile_glsl(self.src, name=name)
@@ -247,15 +274,25 @@ class Matmul:
         if not self.fits(m, n, k):
             raise VkError(f"{self.name}: shape {m}x{n}x{k} not a multiple of "
                           f"({self.bm}, {self.bn}, {TILE})")
+        # Swizzled kernels take a flat 1D grid so that launch order and
+        # traversal order are the same thing.
+        nx = (m // self.bm) * (n // self.bn) if self.group_m else m // self.bm
+        ny = 1 if self.group_m else n // self.bn
         if self.batched:
             push = struct.pack("IIIIII", m, n, k, *strides)
-            groups = (m // self.bm, n // self.bn, nbatch)
+            groups = (nx, ny, nbatch)
         else:
             push = struct.pack("III", m, n, k)
-            groups = (m // self.bm, n // self.bn, 1)
+            groups = (nx, ny, 1)
         if graph is not None:
             graph.record(self.kernel, [a, b, c], groups, push,
                          bytes_hint=self.traffic_bytes(m, n, k, nbatch))
+            # Operand re-reads and output writes have completely different
+            # fixes (bigger tiles vs narrower dtype), so keep them apart.
+            nb_ = nbatch if self.batched else 1
+            getattr(graph, "mm_split", []).append(
+                (nb_ * (m * k * 2 * (n // self.bn) + k * n * 2 * (m // self.bm)),
+                 nb_ * m * n * (2 if self.acc16 else 4)))
             return 0.0
         return self.dev.run(self.kernel, [a, b, c], groups, push, repeat=repeat)
 
@@ -374,6 +411,11 @@ def occupancy(dev, stats, workgroup_threads, min_waves=4):
     return waves, None
 
 
+def lds_only_best(best):
+    """The LDS variant has no swizzled path, so skip stage two when it wins."""
+    return best.get("lds", False)
+
+
 def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
                     verbose=False, use_cache=True, batched=False, nbatch=1):
     """Pick the fastest tile configuration for one shape.
@@ -389,7 +431,8 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
     if key in cache:
         e = cache[key]
         return Matmul(dev, *e["config"], trans_a=trans_a, trans_b=trans_b,
-                      lds=e.get("lds", False), batched=batched), e
+                      lds=e.get("lds", False), batched=batched,
+                      group_m=e.get("group_m", 0)), e
 
     warmup(dev)
     strides = (m * k, k * n, m * n)
@@ -462,6 +505,34 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
 
         results.sort(key=lambda r: -r["tflops"])
         best = results[0]
+
+        # Second stage: for the winning tile only, sweep the workgroup
+        # ordering. Folding group_m into the main search would quadruple the
+        # candidate count for a knob that is nearly orthogonal to tile shape.
+        if not lds_only_best(best):
+            sgb, wmb, wnb = best["config"]
+            gbest = (best["tflops"], 0)
+            for gm in (2, 4, 8):
+                try:
+                    gmm = Matmul(dev, sgb, wmb, wnb, trans_a, trans_b, lds=False,
+                                 batched=batched, group_m=gm)
+                except ValueError:
+                    continue
+                if not gmm.fits(m, n, k):
+                    gmm.destroy()
+                    continue
+                gmm(a, b, c, m, n, k, **call)
+                tg = min(gmm(a, b, c, m, n, k, repeat=3, **call) / 3 for _ in range(3))
+                tf = gmm.flops(m, n, k) * nb / tg / 1e12
+                if verbose:
+                    print(f"    group_m={gm:2d} on winning tile   {tf:7.3f} TFLOPS")
+                if tf > gbest[0]:
+                    gbest = (tf, gm)
+                gmm.destroy()
+            if gbest[1]:
+                best = dict(best, tflops=gbest[0], group_m=gbest[1], lds=False)
+                if verbose:
+                    print(f"    -> group_m={gbest[1]} wins, {gbest[0]:.3f} TFLOPS")
         best["pruned"] = len(pruned)
         best["evaluated"] = len(results)
         if verbose and pruned:
@@ -475,7 +546,8 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
             cache[key] = best
             _save_cache(cache)
         return Matmul(dev, *best["config"], trans_a=trans_a, trans_b=trans_b,
-                      lds=best["lds"], batched=batched), best
+                      lds=best["lds"], batched=batched,
+                      group_m=best.get("group_m", 0)), best
     finally:
         a.destroy()
         b.destroy()

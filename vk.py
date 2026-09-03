@@ -713,6 +713,7 @@ class Graph:
         # (name, compulsory bytes, bytes including tile re-reads). Lets a step
         # be compared against measured DRAM bandwidth instead of guessed at.
         self.traffic = []
+        self.mm_split = []  # (operand read bytes, output write bytes) per matmul
 
     def record(self, kernel, buffers, groups, push=b"", bytes_hint=None):
         if self._finished:

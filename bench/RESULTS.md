@@ -600,3 +600,69 @@ the reduction's inputs were narrowed.
 
 Tuned step after the change: **17.52 ms**, versus a traffic-only prediction of
 17.35 ms, error **-1.0%**.
+
+
+## 30. L2-aware workgroup swizzling
+
+Splitting the matmul traffic properly showed where the step's bytes really go:
+
+| component | MiB | share |
+|---|---|---|
+| matmul operand re-reads (f16) | 756.3 | 53.7% |
+| matmul output writes (f32) | 161.1 | 11.4% |
+| elementwise | 490.5 | 34.8% |
+
+Operand re-reads dominate. Timing single matmuls in isolation and converting to
+implied DRAM traffic at 85.1 GB/s shows how much of that is avoidable:
+
+| shape | implied | compulsory | implied/amplified |
+|---|---|---|---|
+| fc1 2048x768x192 | 18.7 MiB | 7.0 | 0.96 |
+| fc2 2048x192x768 | 15.2 | 4.8 | 1.19 |
+| qkv 2048x576x192 | 11.1 | 5.5 | 0.52 |
+| dW fc1 192x768x2048 | 10.9 | 4.3 | 0.40 |
+| square 1024^3 | 54.8 | 8.0 | 1.24 |
+
+Implied traffic runs 2.7x to 6.9x compulsory. That gap is revisit order, not
+physics: with a natural 2D grid, consecutive workgroups sweep one axis of C and
+each pulls fresh operand blocks. Grouping the launch so a band of `group_m`
+row-blocks completes across all column-blocks keeps that band's A rows and all
+of B resident in L2. Same tiles, same arithmetic, different visit order
+(Triton/CUTLASS grouped rasterisation over a flat 1D dispatch).
+
+Interleaved, median of 11, one fixed tile per shape so only ordering varies:
+
+| shape | g=0 | g=2 | g=4 | g=8 | best |
+|---|---|---|---|---|---|
+| fc1 | 1.24 | 1.37 | 1.38 | 1.27 | 1.11x |
+| fc2 | 1.06 | 1.13 | 1.05 | 1.12 | 1.07x |
+| qkv | 0.70 | 0.97 | 0.87 | 0.76 | **1.38x** |
+| dW fc1 | 1.74 | 1.47 | 1.46 | 1.46 | 1.00x |
+| 1024^3 | 2.20 | 2.40 | 2.36 | 2.17 | 1.09x |
+| 2048^3 | 3.34 | 4.17 | 3.93 | 3.34 | **1.25x** |
+
+Added to the tuner as a cheap second stage (sweep `group_m` for the winning
+tile only, rather than quadrupling the search). New matmul records:
+
+| size | before | after | % of peak | vs CPU |
+|---|---|---|---|---|
+| 2048 | 3.43 | **4.27** TFLOPS | 27.8% | 6.04x |
+| 4096 | 3.76 | **4.47** TFLOPS | 29.1% | 5.91x |
+
+**But the transformer step barely moves.** Interleaved A/B against a worktree
+at the pre-swizzle commit:
+
+```
+old  16.61  17.01  16.84  17.03  16.85   median 16.85 ms
+new  16.64  16.78  16.62  16.62  16.55   median 16.62 ms
+```
+
+**1.4%**, not the 7.3% a cross-run comparison suggested (that difference was
+the old worktree re-tuning to different tiles). Three reasons the step does not
+benefit: at d=192 its matmuls are far smaller than the shapes that gain; the
+`dW` shapes are two thirds of matmul work and gain nothing, since M=192 leaves
+only three row-blocks to group; and the small shapes pick LDS variants, which
+have no swizzled path.
+
+Keep it (free, and large models benefit), but it is not a step-change. This is
+the third time an interleaved A/B has overturned a cross-run number.
