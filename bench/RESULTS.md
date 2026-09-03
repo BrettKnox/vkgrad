@@ -1115,7 +1115,8 @@ already builds. Measured on the 780M:
 | 512 | 2 | 1024 | 1078.7 ms | 949 | 5.54 GiB |
 | 1024 | 2 | 2048 | 3181.2 ms | 644 | 10.05 GiB |
 
-**1,117 tokens/s at 3.92 GiB.** In fine-tuning terms:
+**~956-1,117 tokens/s at 3.92 GiB** (the spread is cross-run variation; see
+section 46). In fine-tuning terms:
 
 | tokens | wall time |
 |---|---|
@@ -1126,17 +1127,14 @@ already builds. Measured on the 780M:
 Domain adaptation on a laptop iGPU with no CUDA is a matter of hours, not a
 matter of renting a GPU.
 
-### Bigger batches are slower here
+### Bigger batches collapse near the memory ceiling
 
-Throughput *falls* with batch size: 1,117 to 844 to 668 going from batch 2 to 8.
-That is backwards from normal GPU practice, where larger batches amortise
-weight reads and fill idle compute.
-
-It follows from everything else in this document. There is no idle compute for a
-larger batch to fill, because the machine is bandwidth-bound (section 27), and
-activation traffic grows linearly with batch while the fixed weight traffic was
-never the bottleneck. Larger batches buy nothing and cost bytes. Anyone porting
-tuning intuitions from discrete NVIDIA hardware will get this exactly backwards.
+**Corrected in section 46.** This originally claimed throughput falls
+monotonically with batch and called it an inversion of standard practice.
+Re-measured, throughput rises or stays flat with batch until the footprint nears
+the memory ceiling, then collapses: 956, 965, then 669 tokens/s at batch 2, 4, 8.
+On a smaller model it rises all the way to batch 4. Ordinary behaviour, with the
+ceiling arriving sooner than on a discrete card.
 
 ### What this does not claim
 
@@ -1228,3 +1226,78 @@ conclusion is unchanged and now rests on five model sizes instead of one:
 training without matrix units costs far less than the 2.9x peak ratio implies.
 
 Ninth correction. Same cause as the first, third, sixth and eighth.
+
+
+## 46. Audit continued: two more claims did not survive
+
+Sections 43 and 44 rested on cross-run measurements. Re-measured properly.
+
+### Record-once was 3.61x, not 4.45x
+
+Eager and recorded paths now coexist, so they can be alternated. Median of 15:
+
+| model | eager | recorded | speedup |
+|---|---|---|---|
+| MNIST MLP, batch 128 | 2.383 ms | 0.661 ms | **3.61x** |
+| MLP 1024x512, batch 256 | 3.524 ms | 1.586 ms | 2.22x |
+
+The published 4.45x came from comparing before and after a code change in
+separate runs: the eager path measures 2.383 ms interleaved, not the 2.937
+recorded then. The recorded figure was right (0.661 vs 0.660).
+
+The speedup also shrinks with model size, which it should: larger models do more
+GPU work per dispatch, so fixed launch overhead is a smaller share. Still the
+difference between viable and not on small models, but 3.61x, not 4.45x.
+
+### Throughput does not fall monotonically with batch
+
+Section 43 claimed throughput falls as batch grows and called it an inversion of
+standard practice. Interleaved on the 10.8M model, median of 9:
+
+| batch | tokens/s | memory |
+|---|---|---|
+| 1 | 12,970 | 0.30 GiB |
+| 2 | 17,503 | 0.42 GiB |
+| 4 | **21,128** | 0.66 GiB |
+| 8 | 19,499 | 1.15 GiB |
+
+Throughput **rises** with batch to a peak at 4. Entirely conventional.
+
+At GPT-2 scale, clean processes:
+
+| batch | tokens/s | memory |
+|---|---|---|
+| 2 | 956 | 3.92 GiB |
+| 4 | 965 | 5.12 GiB |
+| 8 | 669 | 7.51 GiB |
+
+Flat, then a collapse at batch 8. The originally published 1,117 / 844 / 668 was
+again cross-run: batch 2 measures 956 here.
+
+**The correct statement**: throughput rises or stays flat with batch until the
+footprint approaches the memory ceiling, then collapses. That is ordinary
+behaviour. It also explains section 44 exactly: accumulation helps only for
+configurations past the collapse point, which is why it wins at GPT-2 scale and
+loses at 10.8M.
+
+### The pattern in these corrections
+
+Three separate "this inverts standard practice" findings have now dissolved into
+conventional behaviour once measured interleaved:
+
+| claimed | actual |
+|---|---|
+| matrix units worth ~6% | -5% to +18%, median ~8% |
+| throughput falls as batch grows | rises, then collapses at the memory ceiling |
+| accumulation is faster, inverting practice | helps only near the memory ceiling, as usual |
+
+Every one was exciting, counterintuitive, and an artifact of comparing across
+runs. The boring conventional behaviour was the real one each time. The
+mechanism is not subtle: cross-run variation on this machine reaches 20-30%,
+which is the same size as most of these effects, and a difference measured that
+way is a coin flip dressed as a result.
+
+What survives all of it, because it was measured interleaved from the start: the
+machine is bandwidth-bound (section 27, ballast), matmul speedups do not become
+step speedups (1.22-2.19x isolated versus under 20% end to end), and the
+hardware floor for training is far below what the peak FLOPS ratio implies.

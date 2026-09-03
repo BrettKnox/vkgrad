@@ -87,13 +87,15 @@ nothing but talking to the driver.
 
 Recording the entire step once and replaying it:
 
-| | GPU step | vs CPU |
-|---|---|---|
-| one submit per kernel | 2.937 ms | 1.53x |
-| recorded once, replayed | **0.660 ms** | **4.72x** |
+| | GPU step |
+|---|---|
+| one submit per kernel | 2.383 ms |
+| recorded once, replayed | **0.661 ms** |
 
-**4.45x from changing nothing but submission strategy.** Without it the whole
-project reads as a 1.5x curiosity.
+**3.61x from changing nothing but submission strategy** (interleaved; an earlier
+cross-run measurement of this said 4.45x). It shrinks to 2.22x on a larger model,
+as fixed launch overhead becomes a smaller share of the step. Still the
+difference between viable and not at small model sizes.
 
 Two things make the recording possible, and both are consequences of unified
 memory rather than cleverness. The batch and labels are written straight into
@@ -829,20 +831,23 @@ hours, 50M in 12.4 hours. Domain adaptation on a laptop is a matter of hours.
 the weight file, a BPE tokenizer, and embedding/head weight tying, none of which
 is implemented. The throughput and memory are what a fine-tune would see.)
 
-### Bigger batches are slower, which inverts standard practice
+### Batch size: throughput collapses at the memory ceiling
 
-| batch | tokens/s |
-|---|---|
-| 2 | 1,117 |
-| 4 | 844 |
-| 8 | 668 |
+An earlier version of this section claimed throughput falls monotonically with
+batch and called it an inversion of standard practice. That was a cross-run
+artifact. Measured interleaved:
 
-On discrete NVIDIA hardware you raise batch size to amortise weight reads and
-fill idle compute. Neither applies here: there is no idle compute, because the
-machine is bandwidth-bound, and activation traffic grows linearly with batch
-while the fixed weight traffic was never the bottleneck. Tuning intuition ported
-from a discrete card gets this exactly backwards, and the failure mode looks
-like broken hardware rather than a wrong assumption.
+| batch | 10.8M model | GPT-2 scale |
+|---|---|---|
+| 1 | 12,970 tok/s | |
+| 2 | 17,503 | 956 tok/s |
+| 4 | **21,128** | 965 |
+| 8 | 19,499 | 669 |
+
+Throughput rises with batch until the footprint approaches the memory ceiling,
+then collapses. Conventional behaviour. What is specific to this hardware is
+only that the ceiling arrives sooner, because bandwidth and capacity pressure
+rise together.
 
 ## 8. What this cost, and what it needs
 
