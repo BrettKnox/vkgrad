@@ -8,6 +8,7 @@ and what reaches glslc is straight-line code.
 import json
 import os
 import struct
+import time
 
 import numpy as np
 
@@ -28,7 +29,8 @@ _ROW = "gl_CooperativeMatrixLayoutRowMajor"
 _COL = "gl_CooperativeMatrixLayoutColumnMajor"
 
 
-def matmul_glsl(sg=4, wm=2, wn=2, trans_a=False, trans_b=False, batched=False):
+def matmul_glsl(sg=4, wm=2, wn=2, trans_a=False, trans_b=False, batched=False,
+                acc16=False):
     """C[MxN] = A @ B with f16 inputs and f32 accumulation.
 
     sg  subgroups per workgroup (each is one wave32)
@@ -51,7 +53,8 @@ def matmul_glsl(sg=4, wm=2, wn=2, trans_a=False, trans_b=False, batched=False):
     src.append(f"layout(local_size_x = {sg * 32}) in;")
     src.append("layout(binding = 0) readonly  buffer BufA { float16_t A[]; };")
     src.append("layout(binding = 1) readonly  buffer BufB { float16_t B[]; };")
-    src.append("layout(binding = 2) writeonly buffer BufC { float Cm[]; };")
+    src.append("layout(binding = 2) writeonly buffer BufC { %s Cm[]; };"
+               % ("float16_t" if acc16 else "float"))
     if batched:
         # gl_WorkGroupID.z indexes the batch; strides let one dispatch cover
         # every (batch, head) pair of an attention block.
@@ -62,7 +65,8 @@ def matmul_glsl(sg=4, wm=2, wn=2, trans_a=False, trans_b=False, batched=False):
     src.append("")
     src.append("#define MA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>")
     src.append("#define MB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>")
-    src.append("#define MC coopmat<float,     gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>")
+    src.append("#define MC coopmat<%s, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>"
+               % ("float16_t" if acc16 else "float"))
     src.append("")
     src.append("void main() {")
     src.append(f"    uint row0 = gl_WorkGroupID.x * {bm}u + gl_SubgroupID * {wm * TILE}u;")
@@ -205,11 +209,13 @@ class Matmul:
     """One compiled matmul configuration."""
 
     def __init__(self, dev, sg=4, wm=2, wn=2, trans_a=False, trans_b=False,
-                 capture_stats=False, lds=False, bk=32, batched=False):
+                 capture_stats=False, lds=False, bk=32, batched=False,
+                 acc16=False):
         self.dev = dev
         self.sg, self.wm, self.wn = sg, wm, wn
         self.trans_a, self.trans_b = trans_a, trans_b
         self.lds, self.bk, self.batched = lds, bk, batched
+        self.acc16 = acc16
         self.bm = sg * wm * TILE
         self.bn = wn * TILE
         if lds:
@@ -218,10 +224,10 @@ class Matmul:
             self.src = matmul_lds_glsl(sg, wm, wn, bk)
             name = f"mmlds_sg{sg}_wm{wm}_wn{wn}_bk{bk}"
         else:
-            self.src = matmul_glsl(sg, wm, wn, trans_a, trans_b, batched)
+            self.src = matmul_glsl(sg, wm, wn, trans_a, trans_b, batched, acc16)
             name = (f"mm_sg{sg}_wm{wm}_wn{wn}"
                     f"{'_ta' if trans_a else ''}{'_tb' if trans_b else ''}"
-                    f"{'_bat' if batched else ''}")
+                    f"{'_bat' if batched else ''}{'_a16' if acc16 else ''}")
         self.name = name
         self.push_size = 24 if batched else 12
         spv = compile_glsl(self.src, name=name)
@@ -262,7 +268,7 @@ class Matmul:
         nb = nbatch if self.batched else 1
         reads_a = m * k * 2 * (n // self.bn)
         reads_b = k * n * 2 * (m // self.bm)
-        writes_c = m * n * 4
+        writes_c = m * n * (2 if self.acc16 else 4)
         return nb * (reads_a + reads_b + writes_c)
 
     def flops(self, m, n, k):
@@ -302,6 +308,40 @@ def _save_cache(cache):
     with open(tmp, "w") as f:
         json.dump(cache, f, indent=2, sort_keys=True)
     os.replace(tmp, _TUNE_CACHE)
+
+
+_WARMED = set()
+
+
+def warmup(dev, seconds=5.0, force=False):
+    """Run a sustained load until the GPU clocks settle.
+
+    Without this, benchmarking is invalid. Throughput on identical work climbs
+    monotonically from ~1.1 to ~3.1 TFLOPS over the first ~30 dispatches, a
+    2.7x spread, because the GPU starts at idle clocks. Anything measured early
+    in a sweep looks far worse than the same thing measured late, which biases
+    an autotuner toward whatever it happens to evaluate last.
+
+    After a sustained warmup the spread over 30 repeats drops to 1.28x with no
+    trend. Once per process is enough.
+    """
+    if not force and id(dev) in _WARMED:
+        return 0.0
+    m = n = k = 512
+    a = dev.buffer(m * k * 2, "device")
+    b = dev.buffer(k * n * 2, "device")
+    c = dev.buffer(m * n * 4, "device")
+    mm = Matmul(dev, 4, 2, 4)
+    t0 = time.perf_counter()
+    try:
+        while time.perf_counter() - t0 < seconds:
+            mm(a, b, c, m, n, k, repeat=10)
+    finally:
+        mm.destroy()
+        for x in (a, b, c):
+            x.destroy()
+    _WARMED.add(id(dev))
+    return time.perf_counter() - t0
 
 
 def occupancy(dev, stats, workgroup_threads, min_waves=4):
@@ -351,6 +391,7 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
         return Matmul(dev, *e["config"], trans_a=trans_a, trans_b=trans_b,
                       lds=e.get("lds", False), batched=batched), e
 
+    warmup(dev)
     strides = (m * k, k * n, m * n)
     nb = nbatch if batched else 1
     call = dict(nbatch=nb, strides=strides) if batched else {}

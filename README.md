@@ -73,6 +73,10 @@ Add `--quick` to either for a small, safe run on a busy machine.
 Set `VKGRAD_VALIDATE=1` to enable Vulkan validation layers. Do this while
 developing and not while benchmarking: they cost ~30% on submit.
 
+**Benchmarks must warm up.** GPU clocks ramp 2.7x over the first ~30 dispatches,
+so anything measured cold is measuring power management, not the kernel. Every
+bench script calls `kernels.warmup()`; if you write a new one, call it too.
+
 ## Three design choices worth knowing
 
 **Tensors are numpy arrays and GPU buffers at the same time.** Host-visible
@@ -83,7 +87,7 @@ that live on the GPU for the whole run are better off staged once into
 device-local. The allocator picks by role (`shared` / `device` / `cached`), and
 `Device.KINDS` is where that decision lives.
 
-**Bytes moved, not FLOPs.** The ridge point on this hardware is ~205 FLOP/byte.
+**Bytes moved, not FLOPs.** The ridge point on this hardware is ~224 FLOP/byte.
 Effectively nothing in a small training workload is compute-bound, so fusion and
 tile width dominate, and instruction-level tuning is second-order.
 
@@ -98,7 +102,7 @@ version makes adjacent lanes read a whole row apart, so every access is its own
 cache line. This cost 31 ms of a 47 ms transformer step before it was fixed.
 
 **The iGPU's lead over its own CPU is capped by the shared memory bus.** Matmul
-alone hits 8.2x, but full transformer training sits at 2.3-2.9x and does not
+alone hits ~5x, but full transformer training sits at 2.3-2.9x and does not
 improve with model size: both processors share one memory controller, and
 training at these sizes is memory-bound end to end. Expect 2-5x here, not the
 10-100x that discrete-GPU experience suggests.

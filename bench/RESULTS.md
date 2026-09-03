@@ -47,10 +47,10 @@ This is what `Device.KINDS` already exposes, so the allocator can select by role
 
 | | time |
 |---|---|
-| per dispatch, batched into one command buffer | **0.62 us** |
-| per submit + fence wait | **93.61 us** |
+| per dispatch, batched into one command buffer | **0.61 us** |
+| per submit + fence wait | **91.89 us** |
 
-That is a factor of **151**. A training step of ~50 kernels costs ~31 us of launch
+That is a factor of **150**. A training step of ~50 kernels costs ~31 us of launch
 overhead when recorded into one command buffer, versus ~4.7 ms if each is
 submitted separately, which would dominate everything else at small model sizes.
 Record-once-and-replay is not an optimization here. It is the difference between
@@ -62,20 +62,19 @@ viable and not. Section 13 confirms this on the real workload.
 
 | | measured | theoretical | ratio |
 |---|---|---|---|
-| fp32 vector FMA | 4.94 TFLOPS | ~8.2 (dual-issue) | 60% |
-| f16 WMMA (cooperative matrix) | **13.75 TFLOPS** | ~16.6 | **83%** |
+| fp32 vector FMA | 5.30 TFLOPS | ~8.2 (dual-issue) | 65% |
+| f16 WMMA (cooperative matrix) | **15.33 TFLOPS** | ~16.6 | **92%** |
 
-WMMA reaches 83% of theoretical and is **2.8x** fp32. The matrix cores are real,
-reachable from Vulkan on a consumer AMD iGPU under Windows, and close to their
-paper number.
+WMMA reaches 92% of theoretical and is **2.9x** fp32. The matrix cores are real,
+reachable from Vulkan on a consumer AMD iGPU under Windows, and essentially at
+their paper number.
 
-The earlier `--quick` run reported 4.56 TFLOPS for the same kernel. The whole
-3x difference was clock ramp: short kernels never reach boost. Worth remembering
-before drawing conclusions from any brief GPU benchmark.
+These are post-warmup figures. Cold, the same kernels report 13.75 and 4.94,
+and in `--quick` mode 4.56. Section 25 explains why and what it invalidated.
 
 ## 6. Ridge point
 
-**~200 FLOP/byte.** Below that arithmetic intensity a kernel is memory-bound.
+**~224 FLOP/byte.** Below that arithmetic intensity a kernel is memory-bound.
 
 For scale: an unfused elementwise op is ~0.1 FLOP/byte. A fused bias+GELU chain
 is maybe 2. Even a 64x64-tiled fp16 matmul reaches only ~32. **Essentially
@@ -103,7 +102,7 @@ All against a numpy f32 reference, relative error at 1e-6:
 
 Both transposes are layout flips on the cooperative-matrix load
 (`gl_CooperativeMatrixLayoutColumnMajor`), not a materialised transpose. At a
-ridge point of ~200 FLOP/byte, writing a transposed copy would cost more than
+ridge point of ~224 FLOP/byte, writing a transposed copy would cost more than
 the matmul consuming it.
 
 **The backward pass of a linear layer now runs on the matrix cores.** That is
@@ -113,14 +112,17 @@ the piece no existing Vulkan project has.
 
 | size | GPU TFLOPS | % of WMMA peak | CPU TFLOPS (numpy/OpenBLAS, 8 cores) | GPU speedup |
 |---|---|---|---|---|
-| 256 | 0.40 | 2.9% | 0.18 | 2.2x |
-| 512 | 2.19 | 16.0% | 0.49 | 4.5x |
-| 1024 | 3.11 | 22.7% | 0.38 | 8.2x |
-| 2048 | 3.24 | 23.6% | 0.47 | 6.9x |
-| 4096 | **3.63** | **26.4%** | 0.62 | 5.8x |
+| 256 | 0.51 | 3.4% | 0.19 | 2.7x |
+| 512 | 2.22 | 14.5% | 0.45 | 4.9x |
+| 1024 | 3.28 | 21.4% | 0.61 | 5.3x |
+| 2048 | 3.43 | 22.3% | 0.70 | 4.9x |
+| 4096 | **3.76** | **24.5%** | 0.76 | 5.0x |
 
-**The iGPU beats the CPU sharing its die and its DRAM by 4 to 8x.** Below ~256 it is not worth the trouble. That crossover is the
-practical answer to "can you train on hardware people already own".
+**The iGPU beats the CPU sharing its die and its DRAM by about 5x**, steadily,
+for anything at or above 512. Below ~256 it is not worth the trouble. That
+crossover is the practical answer to "can you train on hardware people already
+own". (An earlier cold-clock run of this table showed a spurious 8.2x at 1024,
+caused by an unusually low CPU sample rather than a fast GPU one.)
 
 ## 9. Negative result: LDS staging mostly does not help
 
@@ -313,16 +315,21 @@ the weight-gradient matmuls that is wrong, because those are short and fat
 (`dW = X^T dY` is 192 x 768 x 2048) and a wide tile leaves only 18 workgroups
 for 12 CUs:
 
-| shape | heuristic | autotuned | tile chosen |
-|---|---|---|---|
-| 192 x 768 x 2048 (`dW` qkv) | 0.78 TFLOPS | **3.26** | 64 x 32 |
-| 192 x 192 x 2048 (`dW` proj) | 0.88 TFLOPS | 1.14 | 64 x 16 |
-| 2048 x 768 x 192 (qkv fwd) | 2.71 TFLOPS | 2.60 | 128 x 128 |
+| shape | heuristic | autotuned | gain | tile chosen |
+|---|---|---|---|---|
+| 192 x 192 x 2048 (`dW` proj) | 0.37 TFLOPS | **2.16** | **5.8x** | 64 x 16 |
+| 192 x 768 x 2048 (`dW` qkv) | 2.20 TFLOPS | 3.57 | 1.6x | 64 x 32 |
+| 2048 x 768 x 192 (qkv fwd) | 2.80 TFLOPS | 2.63 | 0.94x | 256 x 128 |
+| 1024 x 1024 x 1024 (square) | 3.30 TFLOPS | 3.30 | 1.00x | 256 x 64 |
 
-A 4.2x gain on the worst shape, by picking a *smaller* tile that yields more
-workgroups. The heuristic is fine for the square-ish forward matmuls and bad
-for the transposed backward ones, which is a good argument for measuring
-instead of reasoning about tile shape.
+Up to 5.8x on a transposed backward shape, by picking a *smaller* tile that
+yields more workgroups. The heuristic is fine for forward matmuls, and on one
+of them the tuner picked slightly worse (0.94x) because a max over ~85 noisy
+candidates favours lucky samples.
+
+These figures are post-warmup. The pre-warmup run of this table reported 4.2x
+on `dW qkv` and only 1.3x on `dW proj`; both were artifacts of clock ramp
+during the sweep. See section 25.
 
 ## 19. Honest remaining gap
 
@@ -348,13 +355,13 @@ Full transformer training step across a 9x parameter range, autotuned:
 | 256 | 4 | 3.24 M | 32.64 ms | 74.54 ms | 2.28x |
 | 384 | 6 | 7.22 M | 49.33 ms | 132.15 ms | 2.68x |
 
-Matmul alone reaches 8.2x. Transformer training sits at 2.3-2.9x and does not
+Matmul alone reaches about 5x. Transformer training sits at 2.3-2.9x and does not
 improve with size. Both processors share one memory controller, and transformer
 training at these sizes is memory-bound end to end, so the ratio converges to a
 bandwidth ratio rather than a compute ratio.
 
 **On an APU the iGPU's advantage over its own CPU is capped by the shared memory
-bus, not by arithmetic.** Most of the 13.75 TFLOPS of matrix hardware is
+bus, not by arithmetic.** Most of the 15.33 TFLOPS of matrix hardware is
 unreachable for training, and more of it would not help.
 
 ## 21. Non-power-of-two tiles
@@ -386,10 +393,10 @@ amplified (every matmul tile re-reads its operands).
 
 | d_model | step | compulsory | amplified | ceiling |
 |---|---|---|---|---|
-| 128 | 11.60 ms | 51.4 GB/s | 78.0 GB/s | 79.75 |
-| 192 | 18.31 ms | 51.3 GB/s | 85.4 GB/s | 79.75 |
-| 256 | 33.21 ms | 37.0 GB/s | 70.5 GB/s | 79.75 |
-| 384 | 48.66 ms | 39.1 GB/s | 85.8 GB/s | 79.75 |
+| 128 | 11.48 ms | 52.0 GB/s | 78.8 GB/s | 79.75 |
+| 192 | 17.72 ms | 53.0 GB/s | 88.2 GB/s | 79.75 |
+| 256 | 32.06 ms | 38.3 GB/s | 73.0 GB/s | 79.75 |
+| 384 | 47.84 ms | 39.8 GB/s | 87.3 GB/s | 79.75 |
 
 The amplified figure sits on the measured DRAM ceiling, flat across a 9x
 parameter range. The step is bandwidth-bound, and effective traffic is close to
@@ -418,19 +425,19 @@ DRAM traffic and measure actual throughput.
 
 | shape | role | traffic-only | >=1/CU | >=4/CU | >=8/CU | rho | best |
 |---|---|---|---|---|---|---|---|
-| 2048x768x192 | qkv forward | 100% | 100% | 100% | 95% | +0.85 | 2.74T |
-| 1024x1024x1024 | square | 94% | 94% | 92% | 94% | +0.66 | 3.22T |
-| 2048x192x768 | dX proj | 53% | 53% | 88% | 90% | +0.68 | 2.01T |
-| 2048x96x192 | head forward | 72% | 72% | 89% | 68% | +0.20 | 1.37T |
-| 192x768x2048 | dW qkv | 49% | 49% | 41% | 38% | -0.11 | 4.20T |
-| 192x192x2048 | dW proj | 23% | 23% | 18% | 96% | -0.29 | 2.22T |
+| 2048x768x192 | qkv forward | 100% | 100% | 100% | 96% | +0.76 | 2.51T |
+| 1024x1024x1024 | square | 100% | 100% | 91% | 94% | +0.67 | 3.21T |
+| 2048x192x768 | dX proj | 51% | 51% | 99% | 100% | +0.71 | 0.67T |
+| 2048x96x192 | head forward | 69% | 69% | 80% | 59% | +0.41 | 0.73T |
+| 192x768x2048 | dW qkv | 52% | 52% | 39% | 22% | +0.11 | 3.11T |
+| 192x192x2048 | dW proj | 22% | 22% | 19% | 94% | -0.32 | 1.96T |
 
 Percentages are the fraction of the measured best achieved by picking the
 minimum-traffic config among those with at least N workgroups.
 
 Forward matmuls: the model picks the optimum, rho strongly positive.
-Transposed weight-gradient matmuls: rho is *negative*, so traffic actively
-misleads. Minimising bytes there favours a tile spanning all of M=192, leaving
+Transposed weight-gradient matmuls: rho collapses to near zero or negative, so
+traffic carries little information and can actively mislead. Minimising bytes there favours a tile spanning all of M=192, leaving
 12 workgroups for 12 CUs with no slack to hide latency.
 
 No workgroup-count floor fixes it. `>=8/CU` takes dW proj from 23% to 96% while
@@ -439,3 +446,41 @@ dropping dW qkv to 38% and costing the forward shapes several percent.
 Empirical autotuning stays necessary, and it pays off exactly on the shapes the
 analytic model gets wrong, which are the two-thirds of matmul work that backward
 represents.
+
+
+## 25. Clock ramp invalidates any benchmark without a warmup
+
+Same matmul, 40 consecutive measurements, nothing else changing:
+
+```
+1.14 1.23 1.19 1.25 1.59 | 1.55 1.91 1.99 1.84 2.21 | 2.26 2.37 2.38 2.49 2.54
+2.62 2.58 2.75 2.79 2.78 | 2.95 2.58 2.51 2.74 3.03 | 2.84 2.96 3.08 3.05 3.06
+3.10 3.02 3.10 3.10 2.81 | 2.97 2.78 2.80 2.71 2.62      TFLOPS
+```
+
+Monotonic climb from 1.14 to 3.10 TFLOPS over ~30 dispatches, **2.7x spread**,
+then a slight thermal decline. First ten versus last ten: **1.83x**.
+
+This biases any autotuner that evaluates candidates in a fixed order, since
+later candidates are measured on a faster GPU. After a 5 s sustained warmup
+(`kernels.warmup()`, now called by every benchmark and by `autotune_matmul`)
+the spread over 30 repeats is **1.28x** with no trend (first ten vs last ten
+0.95x).
+
+Corrected as a result:
+
+| quantity | cold | warm |
+|---|---|---|
+| f16 WMMA peak | 13.75 TFLOPS | 15.33 |
+| fp32 peak | 4.94 TFLOPS | 5.30 |
+| ridge point | 200 FLOP/byte | 224 |
+| autotuner gain, `dW qkv` | 4.2x | 1.6x |
+| autotuner gain, `dW proj` | 1.3x | 5.8x |
+| matmul speedup vs CPU | "4 to 8x" | ~5x, consistent |
+
+Every qualitative conclusion survived. Several headline numbers did not.
+
+Residual 1.28x noise still matters: a max over ~85 tuner candidates is biased
+toward lucky samples, which is the likely cause of the tuner losing to the
+heuristic on one forward shape. Median-of-N would be more robust than the
+current best-of-N.

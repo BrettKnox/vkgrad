@@ -24,12 +24,16 @@ driver. Everything below is measured on this machine; the numbers are in
 
 | | measured |
 |---|---|
-| f16 WMMA peak (cooperative matrix) | 13.75 TFLOPS (83% of theoretical) |
-| fp32 vector peak | 4.94 TFLOPS |
+| f16 WMMA peak (cooperative matrix) | 15.33 TFLOPS (92% of theoretical) |
+| fp32 vector peak | 5.30 TFLOPS |
 | DRAM read bandwidth | 79.75 GB/s (89% of theoretical) |
-| **ridge point** | **~200 FLOP/byte** |
+| **ridge point** | **~224 FLOP/byte** |
 
-Two hundred FLOP per byte is a brutal ratio. For scale: an unfused elementwise
+(All compute figures here are taken after a sustained warmup. See section 2.7:
+without one they read roughly 2x low, and an earlier draft of this document
+under-reported the WMMA peak as 13.75 TFLOPS for exactly that reason.)
+
+Two hundred and twenty-four FLOP per byte is a brutal ratio. For scale: an unfused elementwise
 op is ~0.1 FLOP/byte, a fused bias+GELU chain maybe 2, a 64x64-tiled f16 matmul
 about 32. **Nothing in a small training workload is compute-bound on this
 machine.**
@@ -69,10 +73,10 @@ role rather than having one global answer.
 
 | | cost |
 |---|---|
-| dispatch, batched into one command buffer | 0.62 us |
-| submit + fence | 93.61 us |
+| dispatch, batched into one command buffer | 0.61 us |
+| submit + fence | 91.89 us |
 
-A factor of 151. The MLP training step is 15 dispatches; the transformer step
+A factor of 150. The MLP training step is 15 dispatches; the transformer step
 is 278. Submitting each separately spends 1.4 ms and 26 ms respectively on
 nothing but talking to the driver.
 
@@ -149,14 +153,22 @@ A reasonable heuristic picks the widest tile that divides the shape. That is
 right for square forward matmuls and wrong for the transposed backward ones,
 which are short and fat:
 
-| shape | heuristic | autotuned | tile chosen |
-|---|---|---|---|
-| 192 x 768 x 2048 (`dW` qkv) | 0.78 TFLOPS | **3.26** | 64 x 32 |
-| 192 x 192 x 2048 (`dW` proj) | 0.88 TFLOPS | 1.14 | 64 x 16 |
-| 2048 x 768 x 192 (qkv fwd) | 2.71 TFLOPS | 2.60 | 128 x 128 |
+| shape | heuristic | autotuned | gain | tile chosen |
+|---|---|---|---|---|
+| 192 x 192 x 2048 (`dW` proj) | 0.37 TFLOPS | **2.16** | **5.8x** | 64 x 16 |
+| 192 x 768 x 2048 (`dW` qkv) | 2.20 TFLOPS | 3.57 | 1.6x | 64 x 32 |
+| 2048 x 768 x 192 (qkv fwd) | 2.80 TFLOPS | 2.63 | 0.94x | 256 x 128 |
+| 1024 x 1024 x 1024 (square) | 3.30 TFLOPS | 3.30 | 1.00x | 256 x 64 |
 
-**4.2x on the worst shape by choosing a smaller tile**, because a wide tile left
-only 18 workgroups for 12 CUs.
+The tuner wins on the transposed weight-gradient shapes, by up to 5.8x, and
+does nothing on forward shapes: on `2048 x 768 x 192` it picked slightly
+*worse* than the heuristic, which is the residual measurement noise of section
+2.7 leaking into a max over ~85 candidates. The gain comes from choosing a
+*smaller* tile, because a wide tile leaves only 18 workgroups for 12 CUs.
+
+(An earlier draft claimed 4.2x on `dW qkv`. That was measured before the
+warmup fix and was inflated by clock ramp; the honest figure is 1.6x there and
+5.8x on `dW proj`.)
 
 A related trap: real models have dimensions that are not powers of two. A
 192-wide model with 4 heads has head dim 48, and with only power-of-two tile
@@ -182,17 +194,18 @@ throughput for every candidate config on a shape.
 
 | shape | role | traffic model picks | Spearman rho |
 |---|---|---|---|
-| 2048 x 768 x 192 | qkv forward | **100%** of best | +0.85 |
-| 1024 x 1024 x 1024 | square | 94% | +0.66 |
-| 2048 x 192 x 768 | dX proj | 53% | +0.68 |
-| 2048 x 96 x 192 | head forward | 72% | +0.20 |
-| 192 x 768 x 2048 | **dW qkv** | 49% | **-0.11** |
-| 192 x 192 x 2048 | **dW proj** | 23% | **-0.29** |
+| 2048 x 768 x 192 | qkv forward | **100%** of best | +0.76 |
+| 1024 x 1024 x 1024 | square | **100%** | +0.67 |
+| 2048 x 192 x 768 | dX proj | 51% | +0.71 |
+| 2048 x 96 x 192 | head forward | 69% | +0.41 |
+| 192 x 768 x 2048 | **dW qkv** | 52% | **+0.11** |
+| 192 x 192 x 2048 | **dW proj** | 22% | **-0.32** |
 
 The split is by shape family, not by size. For forward matmuls the model picks
-the measured optimum or close to it, and predicted and measured orderings agree
-strongly. For the transposed weight-gradient matmuls the correlation is
-*negative*: traffic is not merely uninformative there, it points the wrong way.
+the measured optimum, and predicted and measured orderings agree strongly. For
+the transposed weight-gradient matmuls it collapses: rho near zero on one and
+*negative* on the other, so traffic is not merely uninformative there, it can
+point the wrong way.
 
 The mechanism is visible. Those shapes have M=192, so minimising traffic favours
 a tile as wide as the whole M dimension, which leaves 12 workgroups for 12 CUs
@@ -206,7 +219,56 @@ threshold works.
 it earns its cost precisely where the model fails. Since backward runs two
 matmuls for every forward one, the shapes the analytic model gets wrong are the
 majority of the work. This is the concrete reason section 2.5's autotuner found
-a 4.2x gain on exactly these shapes.
+gains of up to 5.8x on exactly these shapes.
+
+### 2.7 Benchmarks on this hardware are invalid without a sustained warmup
+
+This one invalidated several of my own earlier numbers, so it goes in the
+results rather than the appendix.
+
+Running the *same* matmul 40 times in a row, back to back, with nothing else
+changing:
+
+```
+1.14 1.23 1.19 1.25 1.59 | 1.55 1.91 1.99 1.84 2.21 | 2.26 2.37 2.38 2.49 2.54
+2.62 2.58 2.75 2.79 2.78 | 2.95 2.58 2.51 2.74 3.03 | 2.84 2.96 3.08 3.05 3.06
+3.10 3.02 3.10 3.10 2.81 | 2.97 2.78 2.80 2.71 2.62      TFLOPS
+```
+
+Throughput climbs monotonically from 1.14 to 3.10 TFLOPS over roughly 30
+dispatches, a **2.7x spread**, then drifts down slightly as heat accumulates.
+The GPU starts at idle clocks and takes seconds of sustained load to reach its
+boost state. Mean of the first ten measurements versus the last ten: **1.83x**.
+
+This is fatal for an autotuner that walks a candidate list in a fixed order,
+because configurations evaluated late are measured on a faster GPU than
+identical ones evaluated early. It silently rewards whatever happens to be at
+the end of the list.
+
+After a 5 second sustained warmup, the spread over 30 repeats falls to **1.28x**
+with no trend (first ten versus last ten: 0.95x). `kernels.warmup()` now runs
+before every benchmark and at the top of `autotune_matmul`.
+
+What this corrected, once re-measured with clocks settled:
+
+| claim | before warmup | after |
+|---|---|---|
+| f16 WMMA peak | 13.75 TFLOPS | **15.33** |
+| fp32 peak | 4.94 TFLOPS | **5.30** |
+| ridge point | 200 FLOP/byte | **224** |
+| autotuner gain on `dW qkv` | 4.2x | **1.6x** |
+| autotuner gain on `dW proj` | 1.3x | **5.8x** |
+| matmul speedup vs CPU | "4 to 8x" | **~5x, consistent** |
+
+The qualitative conclusions all survived. Several of the headline numbers did
+not. The general lesson is that on a laptop APU, where the GPU shares a power
+and thermal budget with the CPU and sits at idle clocks most of the time, a
+benchmark that does not explicitly reach steady state is measuring the power
+management policy rather than the kernel.
+
+Residual noise of 1.28x still matters: taking a max over ~85 tuner candidates
+biases the winner upward, which is the most likely reason the tuner picked a
+slightly worse config than the heuristic on one forward shape.
 
 ## 3. The headline comparison: an iGPU against the CPU on its own die
 
@@ -218,11 +280,11 @@ publishes an answer to.
 
 | size | GPU TFLOPS | % of WMMA peak | CPU TFLOPS | speedup |
 |---|---|---|---|---|
-| 256 | 0.40 | 2.9% | 0.18 | 2.2x |
-| 512 | 2.19 | 16.0% | 0.49 | 4.5x |
-| 1024 | 3.11 | 22.7% | 0.38 | 8.2x |
-| 2048 | 3.24 | 23.6% | 0.47 | 6.9x |
-| 4096 | 3.63 | 26.4% | 0.62 | 5.8x |
+| 256 | 0.51 | 3.4% | 0.19 | 2.7x |
+| 512 | 2.22 | 14.5% | 0.45 | 4.9x |
+| 1024 | 3.28 | 21.4% | 0.61 | 5.3x |
+| 2048 | 3.43 | 22.3% | 0.70 | 4.9x |
+| 4096 | 3.76 | 24.5% | 0.76 | 5.0x |
 
 **MNIST MLP**, full training step including backward and AdamW: 0.471 ms vs
 2.398 ms, **5.09x**, reaching 97.69% test accuracy in 1.6 seconds of wall time.
@@ -241,7 +303,7 @@ optimiser, so it flatters the CPU.)
 
 ### The interesting part: the transformer speedup is flat
 
-Matmul speedup peaks at 8.2x. Transformer training sits at 2.3 to 2.9x and
+Matmul speedup settles at about 5x. Transformer training sits at 2.3 to 2.9x and
 **does not improve with model size** across a 9x parameter range.
 
 That is not a bug, it is the architecture, and it is measured rather than
@@ -253,10 +315,10 @@ its operands from DRAM (an upper bound, assuming the cache catches nothing).
 
 | d_model | params | step | compulsory | amplified |
 |---|---|---|---|---|
-| 128 | 0.83 M | 11.60 ms | 51.4 GB/s | **78.0 GB/s** |
-| 192 | 1.84 M | 18.31 ms | 51.3 GB/s | **85.4 GB/s** |
-| 256 | 3.24 M | 33.21 ms | 37.0 GB/s | **70.5 GB/s** |
-| 384 | 7.22 M | 48.66 ms | 39.1 GB/s | **85.8 GB/s** |
+| 128 | 0.83 M | 11.48 ms | 52.0 GB/s | **78.8 GB/s** |
+| 192 | 1.84 M | 17.72 ms | 53.0 GB/s | **88.2 GB/s** |
+| 256 | 3.24 M | 32.06 ms | 38.3 GB/s | **73.0 GB/s** |
+| 384 | 7.22 M | 47.84 ms | 39.8 GB/s | **87.3 GB/s** |
 
 The measured DRAM ceiling on this machine is **79.75 GB/s**. The amplified
 figure sits on it, within +/-10%, flat across a 9x parameter range. **The step
@@ -280,7 +342,7 @@ reuse, not distant reuse. That is also why tile *width* was the lever: wider
 tiles reduce the distant re-reads that nothing else is catching.
 
 **On an APU, the iGPU's advantage over its own CPU is capped by the shared
-memory bus, not by arithmetic.** The 13.75 TFLOPS of matrix hardware is mostly
+memory bus, not by arithmetic.** The 15.33 TFLOPS of matrix hardware is mostly
 unreachable for training workloads, and buying more of it would not help. This
 is the opposite of the discrete-GPU intuition, where compute is the scarce
 resource and the interconnect is the thing you optimise around.
@@ -333,6 +395,10 @@ transposes, residual branches, and the embedding scatter-add through
   f32 master weights. No dynamic loss scaling has been needed at these model
   sizes, but it would be at larger ones.
 - **The occupancy pruner is undertuned**, rejecting only 2 of 84 candidates.
+- **Autotuner selection is noisy.** Even warmed up, repeat measurements vary by
+  ~1.28x, and picking the max over ~85 candidates biases toward lucky
+  measurements. A median-of-N criterion would be more robust than the current
+  best-of-N.
 - **CPU baselines use numpy/OpenBLAS**, which is a strong but not maximal CPU
   implementation. The transformer CPU baseline counts matmuls only.
 

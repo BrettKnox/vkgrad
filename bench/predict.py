@@ -21,7 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from kernels import CONFIGS, Matmul  # noqa: E402
+from kernels import CONFIGS, Matmul, warmup  # noqa: E402
 from vk import Device  # noqa: E402
 
 SHAPES = [
@@ -82,6 +82,9 @@ def main():
     args = ap.parse_args()
 
     dev = Device()
+    # Mandatory: GPU clocks ramp ~2.7x over the first ~30 dispatches, which
+    # would make every config measured early look worse than it is.
+    warmup(dev)
     cus = (dev.shader_core_props() or {}).get("cus", 12)
     print(f"{dev.name}, {cus} CUs\n")
     print("% of best achieved by picking min-traffic among configs with >= N workgroups\n")

@@ -28,6 +28,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from autograd import AdamW  # noqa: E402
+from kernels import warmup  # noqa: E402
 from transformer import GPT, TCtx  # noqa: E402
 from vk import Device  # noqa: E402
 
@@ -63,6 +64,7 @@ def main():
     opt.record(g)
     g.finish()
 
+    warmup(dev)
     for _ in range(3):
         g.submit()
     step = min(g.submit() for _ in range(7))

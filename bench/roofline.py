@@ -19,6 +19,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from compile import compile_glsl          # noqa: E402
+from kernels import warmup                # noqa: E402
 from vk import Device, VkError            # noqa: E402
 
 # Grid-stride so the workgroup count stays far below maxComputeWorkGroupCount
@@ -257,6 +258,10 @@ def main():
         print(f"    per dispatch (batched) {d['per_dispatch_us']:.2f} us")
         print(f"    per submit+fence       {d['per_submit_us']:.2f} us")
 
+        # Clocks must be settled before any compute ceiling is measured, or
+        # they read roughly 2x low. The bandwidth tests above are far less
+        # sensitive to this than the FLOPS ones.
+        warmup(dev)
         print("\n[4] fp32 vector peak")
         f = bench_fp32(dev, fma_iters, reps=reps)
         results["fp32"] = f
