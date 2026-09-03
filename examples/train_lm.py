@@ -25,6 +25,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from autograd import AdamW  # noqa: E402
+from dataparallel import GradAccum  # noqa: E402
 from kernels import warmup  # noqa: E402
 from transformer import GPT, TCtx  # noqa: E402
 from vk import Device  # noqa: E402
@@ -70,7 +71,9 @@ def main():
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--heads", type=int, default=6)
     ap.add_argument("--seq", type=int, default=256)
-    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--batch", type=int, default=8, help="microbatch size")
+    ap.add_argument("--accum", type=int, default=1,
+                    help="microbatches per optimiser step; more and smaller is faster here")
     ap.add_argument("--vocab", type=int, default=96)
     ap.add_argument("--lr", type=float, default=6e-4)
     ap.add_argument("--warmup-steps", type=int, default=200)
@@ -110,11 +113,32 @@ def main():
     idv = idb.array(np.uint32, (rows,))
     tgv = tgb.array(np.uint32, (rows,))
 
-    g = dev.graph("train")
-    model.record(idb, tgb, g)
-    opt.record(g)
-    g.finish()
-    print(f"step recorded as {g.n_dispatch} dispatches\n")
+    accum = max(args.accum, 1)
+    ga = None
+    gmicro = gstep = None
+    if accum == 1:
+        g = dev.graph("train")
+        model.record(idb, tgb, g)
+        opt.record(g)
+        g.finish()
+        print(f"step recorded as {g.n_dispatch} dispatches")
+    else:
+        # Many small microbatches beat one large batch on this hardware:
+        # throughput falls as batch grows, because the machine is
+        # bandwidth-bound and activation traffic scales with batch.
+        ga = GradAccum(ctx, params, accum=accum)
+        gmicro = dev.graph("micro")
+        model.record(idb, tgb, gmicro)
+        ga.record_push(gmicro)
+        gmicro.finish()
+        gstep = dev.graph("step")
+        ga.record_apply(gstep, opt)
+        ga.record_zero(gstep)
+        gstep.finish()
+        g = gmicro
+        print(f"microbatch {gmicro.n_dispatch} dispatches x{accum}, "
+              f"step {gstep.n_dispatch}, effective batch {B * accum}")
+    print()
 
     start_step = 0
     if args.resume and os.path.exists(ckpt):
@@ -142,6 +166,26 @@ def main():
             tot += model.read_loss()
         return tot / n_batches
 
+    def train_step(lr):
+        """One optimiser step, over `accum` microbatches."""
+        if accum == 1:
+            x, y = batch_from(train)
+            idv[:] = x
+            tgv[:] = y
+            opt.advance(lr)
+            g.submit()
+            return model.read_loss(), rows
+        tot = 0.0
+        for _ in range(accum):
+            x, y = batch_from(train)
+            idv[:] = x
+            tgv[:] = y
+            gmicro.submit()
+            tot += model.read_loss()
+        opt.advance(lr)
+        gstep.submit()
+        return tot / accum, rows * accum
+
     budget = args.minutes * 60
     t0 = time.perf_counter()
     step = start_step
@@ -152,14 +196,10 @@ def main():
     try:
         while time.perf_counter() - t0 < budget:
             step += 1
-            x, y = batch_from(train)
-            idv[:] = x
-            tgv[:] = y
             lr = args.lr * min(1.0, step / max(args.warmup_steps, 1))
-            opt.advance(lr)
-            g.submit()
-            losses.append(model.read_loss())
-            tokens_done += rows
+            loss, ntok = train_step(lr)
+            losses.append(loss)
+            tokens_done += ntok
 
             if step % args.eval_every == 0:
                 el = time.perf_counter() - t0

@@ -1148,41 +1148,55 @@ output head, which this model does not do (hence 162M parameters rather than
 loading is not written.
 
 
-## 44. Gradient accumulation is faster AND smaller here, inverting standard practice
+## 44. Gradient accumulation helps large models and hurts small ones
 
-Section 43 found that throughput falls as batch grows. The corollary is that a
-large effective batch should be assembled from many small microbatches rather
-than one large one. That is the opposite of how accumulation is normally
-described: on a discrete GPU it is a workaround for insufficient memory that
-costs throughput.
+Section 43 found throughput falling as batch grows, which suggested a large
+effective batch should be assembled from small microbatches. Accumulation is
+the same primitive as the multi-device collective from section 32, with workers
+separated in time rather than across devices, so `dataparallel.GradAccum` reuses
+those kernels.
 
-Accumulation turns out to be the same primitive as the multi-device collective
-from section 32, with the workers separated in time instead of across devices:
-each microbatch adds into an arena, and the optimiser steps once from the sum.
-`dataparallel.GradAccum` reuses those kernels.
+The first version of this section claimed 84% faster and "inverts standard
+practice". Both were wrong, and in the two ways this document keeps getting
+things wrong.
 
-GPT-2 small architecture, effective batch 8 (2,048 tokens), four ways:
+Measured in clean processes, effective batch 8 either way:
 
-| scheme | ms per effective batch | tokens/s | memory |
+| model | one batch of 8 | batch 1 x 8 accum | effect |
 |---|---|---|---|
-| batch 8, no accumulation | 3245.1 | 631 | 8.11 GiB |
-| batch 4 x 2 | 2274.1 | 901 | 5.72 GiB |
-| batch 2 x 4 | 1921.1 | 1,066 | 4.53 GiB |
-| **batch 1 x 8** | **1761.1** | **1,163** | **3.93 GiB** |
+| 10.8M (384d x6), 1.15 GiB | 22,930 tok/s | 15,660 | **32% slower** |
+| 162M (768d x12), 7.51 GiB | 751 tok/s | 1,160 | **54% faster** |
 
-**84% faster and less than half the memory**, for identical effective batch and
-identical gradients. Accumulation is not a concession here, it is the correct
-configuration.
+**It depends on model size, and the direction reverses.** The 84% came from
+comparing across separate runs (a clean-process batch-8 measures 751 tok/s, not
+the 631 originally recorded), and the "inverts standard practice" generalisation
+came from measuring one model size and assuming.
 
-`test_accum.py` verifies the gradients: accumulating N microbatches matches a
-single batch of N times the size to 8.8e-06, after the expected factor of N (a
-microbatch's loss is a mean over its own rows, so the sum is N times too large,
-and the learning rate or loss must be scaled accordingly).
+The mechanism is ordinary once the numbers are right. Accumulation trades a
+fixed per-microbatch overhead (one submit and fence each, plus the push kernels)
+against a memory footprint that shrinks with microbatch size. On a small model
+the per-microbatch work is cheap, so the overhead dominates and accumulation
+loses. On a large model near the memory ceiling, the footprint drops from
+7.51 GiB to 3.93 GiB and that is worth more than the overhead costs.
 
-One bug found on the way, worth recording. The multi-device push uses
-`atomicAdd`, which is required when several devices write the same arena
-concurrently. Reusing it for single-device accumulation issues ~162 million
-atomics per step at GPT-2 scale, which was slow enough to trip the 2-second TDR
-watchdog and return `VK_ERROR_DEVICE_LOST`. Single-device accumulation has one
-writer, so a plain read-modify-write is both correct and much faster. The atomic
-version remains for the multi-device path where it is actually needed.
+So the practical rule is the conventional one after all: use accumulation when
+the large-batch configuration is close to the memory limit, not otherwise. What
+remains specific to this hardware is that the memory limit arrives sooner,
+because bandwidth pressure and capacity pressure rise together.
+
+`test_accum.py` verifies correctness independently of any of this: N
+microbatches match a single batch of N times the size to 8.8e-06, after the
+factor of N that comes from each microbatch's loss being a mean over its own
+rows. `GradAccum.record_apply` now applies that 1/N scale itself, and the
+multi-device path scales by worker count for the same reason, which it was
+previously not doing.
+
+One bug found on the way. The multi-device push uses `atomicAdd`, needed when
+several devices write one arena concurrently. Reusing it for single-device
+accumulation issues ~162 million atomics per step at GPT-2 scale, slow enough to
+trip the 2-second TDR watchdog and return `VK_ERROR_DEVICE_LOST`. Single-device
+accumulation has one writer, so a plain read-modify-write is correct and much
+faster; the atomic path remains for multi-device.
+
+Eighth correction in this document, and the second of the same two kinds:
+comparing across runs, and generalising from a single configuration.

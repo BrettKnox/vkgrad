@@ -87,7 +87,7 @@ def main():
             tot += r.model.forward_backward(r.xbuf, r.ybuf)
             r.push_gradients()
         for r in reps:
-            r.step_from_arena(args.lr)
+            r.step_from_arena(args.lr, n_workers=nd)
         losses.append(tot / nd)
         if step % max(args.steps // 8, 1) == 0:
             print(f"  step {step:5d}  loss {np.mean(losses[-25:]):.4f}")

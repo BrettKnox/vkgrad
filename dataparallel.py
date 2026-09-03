@@ -53,12 +53,17 @@ def make_reduce_kernels(dev):
     K["zero"] = Elementwise(
         dev, "arena_zero", [("arena", "f32", "writeonly")], "arena[i] = 0.0;")
 
-    # Read one parameter's summed gradient back out of the arena.
+    # Read one parameter's summed gradient back out of the arena, scaled.
+    #
+    # The scale matters and is easy to get wrong. Each worker's loss is a mean
+    # over its OWN rows, so summing W workers (or W microbatches) gives a
+    # gradient W times larger than the same examples in one batch. Without the
+    # 1/W the effective learning rate is silently multiplied by W.
     K["pull"] = Elementwise(
         dev, "grad_pull",
         [("arena", "f32", "readonly"), ("g", "f32", "writeonly")],
-        "g[i] = arena[p.off + i];",
-        push=[("off", "uint")])
+        "g[i] = arena[p.off + i] * p.scale;",
+        push=[("off", "uint"), ("scale", "float")])
     return K
 
 
@@ -111,17 +116,18 @@ class Replica:
     def zero_arena(self, graph=None):
         self.K["zero"]([self.arena_buf], self.total, graph=graph)
 
-    def step_from_arena(self, lr):
+    def step_from_arena(self, lr, n_workers=1):
         """Apply AdamW using the shared summed gradient rather than the local
-        one. Identical inputs on every replica keep the weights in lockstep."""
+        one. Identical inputs on every replica keep the weights in lockstep.
+
+        n_workers scales the sum back to a mean, so the effective learning rate
+        does not grow with the device count.
+        """
         self.opt.advance(lr)
         k = self.ctx.K["adamw"]
+        scale = 1.0 / max(n_workers, 1)
         for p, off in zip(self.params, self.offsets):
-            # The arena holds every parameter's gradient contiguously, so the
-            # optimiser reads a slice of it. Offsetting inside the kernel would
-            # need a second push constant; instead each parameter's gradient is
-            # copied back, which is one pass over the parameters.
-            self.K["pull"]([self.arena_buf, p.g32], p.n, off)
+            self.K["pull"]([self.arena_buf, p.g32], p.n, off, scale)
             k([p.w32, p.g32, p.m, p.v, p.w16, self.opt.hp], p.n,
               0.0 if p.no_decay else self.opt.wd)
 
@@ -169,11 +175,16 @@ class GradAccum:
     def record_zero(self, graph):
         self.K["zero"]([self.arena], self.total, graph=graph)
 
-    def record_apply(self, graph, opt):
-        """Move the summed gradient back and take one optimiser step."""
+    def record_apply(self, graph, opt, scale=None):
+        """Move the summed gradient back and take one optimiser step.
+
+        `scale` defaults to 1/accum so the result matches a single batch of
+        accum times the size.
+        """
+        sc = (1.0 / self.accum) if scale is None else scale
         k = self.ctx.K["adamw"]
         for p, o in zip(self.params, self.offsets):
-            self.K["pull"]([self.arena, p.g32], p.n, o, graph=graph)
+            self.K["pull"]([self.arena, p.g32], p.n, o, sc, graph=graph)
             k([p.w32, p.g32, p.m, p.v, p.w16, opt.hp], p.n,
               0.0 if p.no_decay else opt.wd, graph=graph)
 

@@ -137,10 +137,11 @@ for the MLP, 278 for the transformer), replayed each step. Measured effect on
 the MLP: 2.94 ms per step becomes 0.66 ms. Anything that changes per step lives
 in mapped memory rather than push constants, which are baked in at record time.
 
-**Gradient accumulation is faster than a large batch, not a concession to it.**
-Throughput falls as batch grows, so an effective batch of 8 runs 84% faster and
-in half the memory as eight microbatches of 1. Discrete-GPU intuition has this
-backwards.
+**Gradient accumulation pays only for large models.** At GPT-2 scale, near the
+memory ceiling, eight microbatches of 1 are 54% faster than one batch of 8 and
+use half the memory. On a 10.8M model it is 32% *slower*, because the fixed
+per-microbatch overhead dominates. Use it when the large-batch configuration is
+close to the memory limit.
 
 **Row kernels get one subgroup per row, not one thread per row.** The obvious
 version makes adjacent lanes read a whole row apart, so every access is its own
