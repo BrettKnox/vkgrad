@@ -1008,3 +1008,39 @@ table.
 
 This is the most direct statement of the project's thesis. The barrier to
 training on hardware people already own was never that the silicon cannot do it.
+
+
+## 41. Extrapolated throughput was 19% optimistic
+
+Section 40's time-to-train figures came from step times measured as best-of-four
+back-to-back submits. `examples/train_lm.py` runs the same 10.8M model for a
+wall-clock budget with real data loading, loss readback, held-out validation and
+checkpointing, and logs what actually happens.
+
+First result, 2 minutes:
+
+| step | train | val | tokens/s |
+|---|---|---|---|
+| 300 | 2.4239 | 2.3405 | 19,641 |
+| 700 | 2.0944 | 2.0346 | 19,020 |
+| 1100 | 1.7553 | 1.7384 | 18,825 |
+
+1,100 steps, 2.25M tokens, loss 4.6176 to 1.7553, validation 1.6600.
+
+| | tokens/s | Chinchilla time |
+|---|---|---|
+| extrapolated from step times | 22,984 | 2.6 h |
+| **measured in a real run** | **18,538** | **3.2 h** |
+
+**19% optimistic.** The gap is per-step Python that does not overlap the GPU:
+batch index construction, the loss readback, and periodic checkpoint writes. The
+step time itself was right; the assumption that nothing else costs anything was
+not.
+
+Every time-to-train number in section 40 should be read as roughly 20% longer.
+The ordering and the memory figures are unaffected.
+
+Fifth projection in this document corrected by measuring it, and the pattern is
+consistent: quantities measured in isolation do not predict behaviour in situ,
+exactly as configs timed in isolation did not predict tuner choice and peak
+FLOPS measured cold did not predict warm.

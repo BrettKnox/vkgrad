@@ -12,3 +12,7 @@ bench/runs/
 
 __pycache__/
 *.pyc
+
+# Training run outputs.
+runs/
+data/pycorpus.npy
