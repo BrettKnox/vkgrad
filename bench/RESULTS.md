@@ -1010,37 +1010,50 @@ This is the most direct statement of the project's thesis. The barrier to
 training on hardware people already own was never that the silicon cannot do it.
 
 
-## 41. Extrapolated throughput was 19% optimistic
+## 41. Sustained throughput, and an over-correction
 
 Section 40's time-to-train figures came from step times measured as best-of-four
 back-to-back submits. `examples/train_lm.py` runs the same 10.8M model for a
 wall-clock budget with real data loading, loss readback, held-out validation and
-checkpointing, and logs what actually happens.
+checkpointing.
 
-First result, 2 minutes:
+A 2-minute run reported 18,538 tokens/s and I recorded that as the
+extrapolation being "19% optimistic". That conclusion was wrong: two minutes is
+not long enough to measure sustained throughput, because the cumulative average
+is still dominated by startup.
 
-| step | train | val | tokens/s |
+A 12-minute run:
+
+| step | train | val | tokens/s (cumulative) |
 |---|---|---|---|
-| 300 | 2.4239 | 2.3405 | 19,641 |
-| 700 | 2.0944 | 2.0346 | 19,020 |
-| 1100 | 1.7553 | 1.7384 | 18,825 |
+| 500 | 2.5573 | 2.1464 | 22,124 |
+| 2500 | 1.2084 | 1.2119 | 21,553 |
+| 5000 | 0.9531 | 0.9845 | 21,473 |
+| 7500 | 0.8784 | 0.8981 | 21,436 |
 
-1,100 steps, 2.25M tokens, loss 4.6176 to 1.7553, validation 1.6600.
+7,518 steps, 15.4M tokens, loss 4.7821 to 0.8717, validation 0.9123.
+
+The apparent decline is a converging cumulative average, not throttling: the
+successive deltas shrink (-392, -92, -64, -23, ... -8), and instantaneous
+throughput over the final six minutes is **21,672 tokens/s**, slightly above the
+cumulative figure. There is no thermal decay over 12 minutes of saturation.
 
 | | tokens/s | Chinchilla time |
 |---|---|---|
 | extrapolated from step times | 22,984 | 2.6 h |
-| **measured in a real run** | **18,538** | **3.2 h** |
+| 2-minute run (too short) | 18,538 | 3.2 h |
+| **12-minute sustained** | **21,382** | **2.8 h** |
 
-**19% optimistic.** The gap is per-step Python that does not overlap the GPU:
-batch index construction, the loss readback, and periodic checkpoint writes. The
-step time itself was right; the assumption that nothing else costs anything was
-not.
+So the extrapolation was about **7% optimistic**, not 19%. Section 40's figures
+should be read as roughly 7% longer.
 
-Every time-to-train number in section 40 should be read as roughly 20% longer.
-The ordering and the memory figures are unaffected.
+The meta-result is the more useful one. Having spent five sections establishing
+that quantities measured in isolation do not predict behaviour in situ, I then
+over-corrected from a two-minute sample and wrote it down as fact. The failure
+mode is identical to the clock-ramp bug in section 25, one level up: a
+measurement taken before the system reaches steady state, treated as steady
+state. Two minutes was the new "cold clocks".
 
-Fifth projection in this document corrected by measuring it, and the pattern is
-consistent: quantities measured in isolation do not predict behaviour in situ,
-exactly as configs timed in isolation did not predict tuner choice and peak
-FLOPS measured cold did not predict warm.
+What is not in question: a 10.8M-parameter transformer reaches validation loss
+0.91 on held-out Python source in 12 minutes on an integrated laptop GPU, with
+no CUDA and no ROCm.
