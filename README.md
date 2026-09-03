@@ -49,6 +49,7 @@ test_kernels.py    kernel correctness vs numpy
 test_autograd.py   gradient checks vs numpy and finite differences
 test_transformer.py  full transformer fwd+bwd vs an independent numpy model
 test_shared.py     host memory imported by several independent VkDevices
+test_accum.py      gradient accumulation equals one large batch
 check_device.py    will vkgrad run on this GPU, and what will it get
 examples/mnist.py  trains an MLP, races it against the same model on the CPU
 examples/charlm.py trains a char-level transformer on local text
@@ -135,6 +136,11 @@ costs 127 us. A training step is one pre-recorded command buffer (15 dispatches
 for the MLP, 278 for the transformer), replayed each step. Measured effect on
 the MLP: 2.94 ms per step becomes 0.66 ms. Anything that changes per step lives
 in mapped memory rather than push constants, which are baked in at record time.
+
+**Gradient accumulation is faster than a large batch, not a concession to it.**
+Throughput falls as batch grows, so an effective batch of 8 runs 84% faster and
+in half the memory as eight microbatches of 1. Discrete-GPU intuition has this
+backwards.
 
 **Row kernels get one subgroup per row, not one thread per row.** The obvious
 version makes adjacent lanes read a whole row apart, so every access is its own

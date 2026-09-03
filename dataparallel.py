@@ -39,6 +39,17 @@ def make_reduce_kernels(dev):
         push=[("off", "uint")],
         extensions=["GL_EXT_shader_atomic_float"])
 
+    # Non-atomic accumulate, for a single writer. Gradient accumulation on one
+    # device has no concurrent writers, and at GPT-2 scale a step issues ~162
+    # million atomics, which is slow enough to trip the 2 s TDR watchdog and
+    # lose the device. A plain read-modify-write is both correct here and much
+    # faster.
+    K["add"] = Elementwise(
+        dev, "grad_add",
+        [("g", "f32", "readonly"), ("arena", "f32", "")],
+        "arena[p.off + i] += g[i];",
+        push=[("off", "uint")])
+
     K["zero"] = Elementwise(
         dev, "arena_zero", [("arena", "f32", "writeonly")], "arena[i] = 0.0;")
 
@@ -119,3 +130,53 @@ class Replica:
             k.destroy()
         self.arena_buf.destroy()
         self.ctx.destroy()
+
+
+class GradAccum:
+    """Gradient accumulation over microbatches, on one device.
+
+    This is the same primitive as the multi-device exchange above, with the
+    workers separated in time rather than across devices: each microbatch adds
+    its gradients into an arena, and the optimiser steps once from the sum.
+
+    It matters more here than on a discrete GPU. Throughput on this hardware
+    *falls* as batch grows (1,117 to 668 tokens/s from batch 2 to 8 at GPT-2
+    scale) because the machine is bandwidth-bound and activation traffic scales
+    with batch. So a large effective batch is cheaper as many small microbatches
+    than as one large batch, which is the opposite of the usual advice.
+    """
+
+    def __init__(self, ctx, params, accum=1):
+        self.ctx, self.params, self.accum = ctx, list(params), accum
+        self.K = make_reduce_kernels(ctx.dev)
+        offs, off = [], 0
+        for p in self.params:
+            offs.append(off)
+            off += p.n
+        self.offsets, self.total = offs, off
+        # Device-local: nothing outside this device reads it.
+        self.arena = ctx.buf(off * 4, "device")
+
+    def record_push(self, graph):
+        """Add this microbatch's gradients into the accumulator.
+
+        Uses the non-atomic add: one device, one writer, and the atomic version
+        is slow enough at scale to lose the device to the TDR watchdog.
+        """
+        for p, o in zip(self.params, self.offsets):
+            self.K["add"]([p.g32, self.arena], p.n, o, graph=graph)
+
+    def record_zero(self, graph):
+        self.K["zero"]([self.arena], self.total, graph=graph)
+
+    def record_apply(self, graph, opt):
+        """Move the summed gradient back and take one optimiser step."""
+        k = self.ctx.K["adamw"]
+        for p, o in zip(self.params, self.offsets):
+            self.K["pull"]([self.arena, p.g32], p.n, o, graph=graph)
+            k([p.w32, p.g32, p.m, p.v, p.w16, opt.hp], p.n,
+              0.0 if p.no_decay else opt.wd, graph=graph)
+
+    def destroy(self):
+        for k in self.K.values():
+            k.destroy()

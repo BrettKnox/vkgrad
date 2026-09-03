@@ -1146,3 +1146,43 @@ of which is implemented here, plus weight tying between the embedding and the
 output head, which this model does not do (hence 162M parameters rather than
 124M). The throughput and memory figures are what a fine-tune would see; the
 loading is not written.
+
+
+## 44. Gradient accumulation is faster AND smaller here, inverting standard practice
+
+Section 43 found that throughput falls as batch grows. The corollary is that a
+large effective batch should be assembled from many small microbatches rather
+than one large one. That is the opposite of how accumulation is normally
+described: on a discrete GPU it is a workaround for insufficient memory that
+costs throughput.
+
+Accumulation turns out to be the same primitive as the multi-device collective
+from section 32, with the workers separated in time instead of across devices:
+each microbatch adds into an arena, and the optimiser steps once from the sum.
+`dataparallel.GradAccum` reuses those kernels.
+
+GPT-2 small architecture, effective batch 8 (2,048 tokens), four ways:
+
+| scheme | ms per effective batch | tokens/s | memory |
+|---|---|---|---|
+| batch 8, no accumulation | 3245.1 | 631 | 8.11 GiB |
+| batch 4 x 2 | 2274.1 | 901 | 5.72 GiB |
+| batch 2 x 4 | 1921.1 | 1,066 | 4.53 GiB |
+| **batch 1 x 8** | **1761.1** | **1,163** | **3.93 GiB** |
+
+**84% faster and less than half the memory**, for identical effective batch and
+identical gradients. Accumulation is not a concession here, it is the correct
+configuration.
+
+`test_accum.py` verifies the gradients: accumulating N microbatches matches a
+single batch of N times the size to 8.8e-06, after the expected factor of N (a
+microbatch's loss is a mean over its own rows, so the sum is N times too large,
+and the learning rate or loss must be scaled accordingly).
+
+One bug found on the way, worth recording. The multi-device push uses
+`atomicAdd`, which is required when several devices write the same arena
+concurrently. Reusing it for single-device accumulation issues ~162 million
+atomics per step at GPT-2 scale, which was slow enough to trip the 2-second TDR
+watchdog and return `VK_ERROR_DEVICE_LOST`. Single-device accumulation has one
+writer, so a plain read-modify-write is both correct and much faster. The atomic
+version remains for the multi-device path where it is actually needed.
