@@ -1096,3 +1096,53 @@ identical from the output, and the instinct is to blame the model.
 
 Total cost of this result: an integrated GPU, no CUDA, no ROCm, no downloaded
 dataset, and twelve minutes.
+
+
+## 43. GPT-2 small's architecture runs on an integrated GPU
+
+Training from scratch is not how most people would use this. Fine-tuning an
+existing model is. So: does a real model's architecture even fit?
+
+GPT-2 small (768 d_model, 12 layers, 12 heads, vocab 50257, learned positional
+embeddings, pre-LayerNorm, GELU) is architecturally what `transformer.py`
+already builds. Measured on the 780M:
+
+| seq | batch | tokens/step | step | tokens/s | memory |
+|---|---|---|---|---|---|
+| 256 | 2 | 512 | 458.5 ms | **1,117** | 3.92 GiB |
+| 256 | 4 | 1024 | 1213.7 ms | 844 | 5.12 GiB |
+| 256 | 8 | 2048 | 3064.7 ms | 668 | 7.51 GiB |
+| 512 | 2 | 1024 | 1078.7 ms | 949 | 5.54 GiB |
+| 1024 | 2 | 2048 | 3181.2 ms | 644 | 10.05 GiB |
+
+**1,117 tokens/s at 3.92 GiB.** In fine-tuning terms:
+
+| tokens | wall time |
+|---|---|
+| 1 M | **15 minutes** |
+| 10 M | **2.5 hours** |
+| 50 M | 12.4 hours |
+
+Domain adaptation on a laptop iGPU with no CUDA is a matter of hours, not a
+matter of renting a GPU.
+
+### Bigger batches are slower here
+
+Throughput *falls* with batch size: 1,117 to 844 to 668 going from batch 2 to 8.
+That is backwards from normal GPU practice, where larger batches amortise
+weight reads and fill idle compute.
+
+It follows from everything else in this document. There is no idle compute for a
+larger batch to fill, because the machine is bandwidth-bound (section 27), and
+activation traffic grows linearly with batch while the fixed weight traffic was
+never the bottleneck. Larger batches buy nothing and cost bytes. Anyone porting
+tuning intuitions from discrete NVIDIA hardware will get this exactly backwards.
+
+### What this does not claim
+
+This measures the architecture with random weights. Loading actual GPT-2
+checkpoints would additionally need the weight file and a BPE tokenizer, neither
+of which is implemented here, plus weight tying between the embedding and the
+output head, which this model does not do (hence 162M parameters rather than
+124M). The throughput and memory figures are what a fine-tune would see; the
+loading is not written.
