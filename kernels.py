@@ -603,6 +603,16 @@ def make_kernels(dev):
         dz32[i] = g;
         """)
 
+    # f16-only variant: the bias column sum can read the f16 gradient the
+    # matmuls already need, so the f32 duplicate is dead weight.
+    K["bias_gelu_bwd16"] = Elementwise(
+        dev, "bias_gelu_bwd16",
+        [("dy", "f32", "readonly"), ("z", "f32", "readonly"),
+         ("dz", "f16", "writeonly")],
+        """
+        dz[i] = float16_t(dy[i] * dgelu(z[i]));
+        """)
+
     # z = acc + bias, no activation (output layer).
     K["bias"] = Elementwise(
         dev, "bias",

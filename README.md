@@ -23,7 +23,7 @@ Write-up: [RESEARCH.md](RESEARCH.md). Raw measurements: [bench/RESULTS.md](bench
 
 Headline: **5.1x faster than the CPU sharing the same die and the same DRAM**
 on a full MNIST training step (forward, backward, AdamW), 97.69% test accuracy.
-A 1.84M parameter transformer trains at 3.14x the CPU, with every gradient
+A 1.84M parameter transformer trains at 3.41x the CPU, with every gradient
 tensor matching an independent numpy model.
 
 ## Layout

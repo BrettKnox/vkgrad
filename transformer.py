@@ -27,10 +27,13 @@ class TCtx(Ctx):
         super().__init__(dev, tune)
         self.TK = make_transformer_kernels(dev)
 
-    def col_sum(self, src, dst, ncol, nrow, graph=None):
+    def col_sum(self, src, dst, ncol, nrow, graph=None, f16=True):
+        """Column sums of a gradient. Reads f16 by default: every tensor whose
+        column sum is needed already exists in f16 for the matmuls, so the f32
+        copy is pure traffic."""
         self.TK["col_sum_zero"]([dst], ncol, graph=graph)
-        self.TK["col_sum_chunk"]([src, dst], NCHUNK * ncol, ncol, nrow, NCHUNK,
-                                 graph=graph)
+        k = "col_sum_chunk16" if f16 else "col_sum_chunk"
+        self.TK[k]([src, dst], NCHUNK * ncol, ncol, nrow, NCHUNK, graph=graph)
 
     def destroy(self):
         for k in self.TK.values():
@@ -47,7 +50,8 @@ class LayerNorm:
         self.mu = ctx.buf(rows * 4)
         self.rstd = ctx.buf(rows * 4)
         self.dx = ctx.buf(rows * D * 4)
-        self.dyxh = ctx.buf(rows * D * 4)
+        self.dyxh = ctx.buf(rows * D * 2)
+        self.dy16 = ctx.buf(rows * D * 2)
 
     def forward(self, x32, graph=None):
         self.x32 = x32
@@ -59,10 +63,11 @@ class LayerNorm:
     def backward(self, dy32, graph=None):
         c = self.ctx
         c.TK["layernorm_bwd"](
-            [dy32, self.x32, self.g.w32, self.mu, self.rstd, self.dx, self.dyxh],
+            [dy32, self.x32, self.g.w32, self.mu, self.rstd, self.dx,
+             self.dyxh, self.dy16],
             self.rows * 32, self.D, graph=graph)
         c.col_sum(self.dyxh, self.g.g32, self.D, self.rows, graph=graph)
-        c.col_sum(dy32, self.b.g32, self.D, self.rows, graph=graph)
+        c.col_sum(self.dy16, self.b.g32, self.D, self.rows, graph=graph)
         return self.dx
 
 
@@ -87,11 +92,11 @@ class Dense:
             x16, self.W.w16, self.acc, self.rows, self.out_f, self.in_f, graph=graph)
         return self.acc
 
-    def backward(self, dy16, dy32, need_dx=True, graph=None):
+    def backward(self, dy16, need_dx=True, graph=None):
         c = self.ctx
         c.matmul(self.in_f, self.out_f, self.rows, trans_a=True)(
             self.x16, dy16, self.W.g32, self.in_f, self.out_f, self.rows, graph=graph)
-        c.col_sum(dy32, self.b.g32, self.out_f, self.rows, graph=graph)
+        c.col_sum(dy16, self.b.g32, self.out_f, self.rows, graph=graph)
         if not need_dx:
             return None
         c.matmul(self.rows, self.in_f, self.out_f, trans_b=True)(
@@ -127,7 +132,6 @@ class Attention:
         self.dq32 = ctx.buf(head * 4)
         self.dk32 = ctx.buf(head * 4)
         self.dv32 = ctx.buf(head * 4)
-        self.dqkv32 = ctx.buf(self.rows * 3 * D * 4)
         self.dqkv16 = ctx.buf(self.rows * 3 * D * 2)
 
     def forward(self, x16, graph=None):
@@ -149,10 +153,10 @@ class Attention:
                           graph=graph)
         return self.proj.forward(self.ao16, graph=graph)
 
-    def backward(self, dy16, dy32, graph=None):
+    def backward(self, dy16, graph=None):
         c, TK = self.ctx, self.ctx.TK
         T, hd, D, H = self.T, self.hd, self.D, self.H
-        dao = self.proj.backward(dy16, dy32, need_dx=True, graph=graph)
+        dao = self.proj.backward(dy16, need_dx=True, graph=graph)
         TK["split_heads"]([dao, self.dao16], self.rows * D, D, T, H, hd, graph=graph)
 
         # dV = P^T @ dOut
@@ -173,10 +177,9 @@ class Attention:
             self.ds16, self.q16, self.dk32, T, hd, T, graph=graph,
             nbatch=self.nbh, strides=(T * T, T * hd, T * hd))
 
-        TK["merge_qkv_grad"]([self.dq32, self.dk32, self.dv32,
-                              self.dqkv32, self.dqkv16],
+        TK["merge_qkv_grad"]([self.dq32, self.dk32, self.dv32, self.dqkv16],
                              self.rows * D, D, T, H, hd, graph=graph)
-        return self.qkv.backward(self.dqkv16, self.dqkv32, need_dx=True, graph=graph)
+        return self.qkv.backward(self.dqkv16, need_dx=True, graph=graph)
 
 
 class Block:
@@ -195,7 +198,6 @@ class Block:
         self.z1 = ctx.buf(self.rows * 4 * D * 4)
         self.h16 = ctx.buf(self.rows * 4 * D * 2)
         self.dh16 = ctx.buf(self.rows * 4 * D * 2)
-        self.dh32 = ctx.buf(self.rows * 4 * D * 4)
         self.dres1 = ctx.buf(self.rows * D * 4)
         self.dx = ctx.buf(self.rows * D * 4)
         self.attn16 = ctx.buf(self.rows * D * 2)
@@ -222,16 +224,16 @@ class Block:
         n = self.rows * self.D
         # MLP branch. The residual sends the same gradient down both paths.
         TK["to16"]([d32, self.mlp16], n, graph=graph)
-        dh = self.fc2.backward(self.mlp16, d32, need_dx=True, graph=graph)
-        K["bias_gelu_bwd"]([dh, self.z1, self.dh16, self.dh32],
-                           self.rows * 4 * self.D, graph=graph)
-        dln2 = self.fc1.backward(self.dh16, self.dh32, need_dx=True, graph=graph)
+        dh = self.fc2.backward(self.mlp16, need_dx=True, graph=graph)
+        K["bias_gelu_bwd16"]([dh, self.z1, self.dh16],
+                             self.rows * 4 * self.D, graph=graph)
+        dln2 = self.fc1.backward(self.dh16, need_dx=True, graph=graph)
         dres1_mlp = self.ln2.backward(dln2, graph=graph)
         TK["add"]([d32, dres1_mlp, self.dres1], n, graph=graph)
 
         # Attention branch.
         TK["to16"]([self.dres1, self.attn16], n, graph=graph)
-        dln1 = self.attn.backward(self.attn16, self.dres1, graph=graph)
+        dln1 = self.attn.backward(self.attn16, graph=graph)
         dx_attn = self.ln1.backward(dln1, graph=graph)
         TK["add"]([self.dres1, dx_attn, self.dx], n, graph=graph)
         return self.dx
@@ -294,7 +296,7 @@ class GPT:
         logits = self.forward(ids_buf, graph=graph)
         K["softmax_ce"]([logits, targets_buf, self.dlog16, self.dlog32, self.loss],
                         self.rows, self.pad_vocab, self.vocab, graph=graph)
-        d = self.head.backward(self.dlog16, self.dlog32, need_dx=True, graph=graph)
+        d = self.head.backward(self.dlog16, need_dx=True, graph=graph)
         d = self.lnf.backward(d, graph=graph)
         for b in reversed(self.blocks):
             d = b.backward(d, graph=graph)

@@ -381,6 +381,64 @@ and gradient tensors to f16 accumulation is worth about 59 MiB, or **4%**.
 Neither is transformative, which is the useful part: the model says where the
 ceiling is, and it is close.
 
+### 2.10 Using the model as a design tool, and checking that it was right
+
+Sections 2.9 and 3 give a causal law and an exchange rate. The test of a model
+is whether it can price something that does not exist yet and then be held to
+it, so: the cheapest item it priced was eliminating the duplicated f32 gradient
+buffers, at roughly 5% of a step. This section is that prediction, the change,
+and the verdict.
+
+The redundancy: every tensor whose column sum is needed for a bias gradient
+already exists in f16, because the matmuls require f16 operands. The f32 copies
+(`dz32`, `dqkv32`, and an f32 `dyxh` out of LayerNorm) existed only so the
+reduction kernel could read f32. Making `col_sum` read f16 instead, while still
+accumulating in f32, deletes those writes and halves the reduction's reads.
+
+Predicted, by hand from the shapes at rows=2048, D=192, before implementing:
+
+| change | bytes per layer |
+|---|---|
+| drop `dz32` write | 6.29 MB |
+| fc1 bias reduction reads f16 | 3.15 MB |
+| drop `dqkv32` write | 4.72 MB |
+| qkv bias reduction reads f16 | 2.36 MB |
+| LayerNorm f16 `dyxh` and `dy16`, x2 | ~3.15 MB |
+| fc2 and proj bias reductions read f16 | ~1.6 MB |
+
+~21.3 MB per layer, ~81 MiB over four layers, which at 85.1 GB/s is ~1.0 ms of
+a ~21.6 ms step: **4.7%**.
+
+Measured by alternating the old and new code in time, six rounds each, using a
+git worktree at the previous commit so the two versions could not be confounded
+by drift:
+
+```
+old  21.52  21.46  23.13  21.43  21.66  22.34   median 21.59 ms
+new  20.33  20.53  20.40  20.37  20.41  21.10   median 20.41 ms
+```
+
+| | predicted | actual | error |
+|---|---|---|---|
+| bytes saved | 81 MiB | 82.9 MiB | 2.3% |
+| time saved | 1.02 ms | 1.19 ms | 16% |
+| step speedup | 4.7% | **5.5%** | |
+
+The byte accounting was accurate to 2%, and the causal law converted it into a
+time saving of the right sign and magnitude, under-predicting by 16% in the
+same direction as section 2.9's residue. **The model priced work that did not
+exist and the work delivered.**
+
+Two things fell out that were not predicted. The optimised version is markedly
+more *stable*, 20.33 to 20.53 ms versus 21.43 to 23.13, presumably because less
+traffic means less contention for a memory controller shared with the CPU. And
+gradient accuracy was unaffected: all 20 tensors still match the numpy
+reference, worst case 2.64e-03 against 2.53e-03 before, because the reduction
+still accumulates in f32 and only its inputs were narrowed.
+
+The tuned step is now **17.52 ms**, against a traffic-only prediction of
+17.35 ms, an error of **-1.0%**.
+
 ## 3. The headline comparison: an iGPU against the CPU on its own die
 
 Same silicon, same DRAM, same model. This is the question that matters for
@@ -501,9 +559,11 @@ transposes, residual branches, and the embedding scatter-add through
   workgroups is the obvious fix and is not implemented. Section 2.9 caps what
   it could win: the step is bandwidth-bound with only a ~10% non-bandwidth
   residue, so scheduling fixes cannot buy much.
-- **Known traffic savings, unimplemented.** Duplicated f32 gradient buffers are
-  worth ~5% of a step and f16 attention accumulation another ~4%, priced using
-  the exchange rate in 2.9. Neither has been built.
+- **One priced saving remains unimplemented.** f16 accumulation for the
+  attention score and gradient tensors is worth ~4% by the section 2.9
+  exchange rate. The duplicated f32 gradient buffers were the other item and
+  have been removed (section 2.10). A leftover `dlog32` write, now unused by
+  the transformer, is worth a further 0.05% and is not worth the churn.
 - **Tile-aligned shapes only.** Ragged dimensions are handled by padding the
   allocation, not by a masked epilogue in the kernel.
 - **f16 only for matmul inputs.** The hardware exposes f16 and int8 cooperative

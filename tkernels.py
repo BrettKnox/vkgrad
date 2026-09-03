@@ -54,7 +54,7 @@ def make_transformer_kernels(dev):
         [("dy", "f32", "readonly"), ("x", "f32", "readonly"),
          ("gamma", "f32", "readonly"), ("mu", "f32", "readonly"),
          ("rstd", "f32", "readonly"), ("dx", "f32", "writeonly"),
-         ("dyxh", "f32", "writeonly")],
+         ("dyxh", "f16", "writeonly"), ("dy16", "f16", "writeonly")],
         """
         uint row = gl_WorkGroupID.x;
         uint lane = gl_SubgroupInvocationID;
@@ -66,7 +66,8 @@ def make_transformer_kernels(dev):
             float dxh = dy[base + d] * gamma[d];
             sum_dxh += dxh;
             sum_dxh_xh += dxh * xh;
-            dyxh[base + d] = dy[base + d] * xh;
+            dyxh[base + d] = float16_t(dy[base + d] * xh);
+            dy16[base + d] = float16_t(dy[base + d]);
         }
         sum_dxh = subgroupAdd(sum_dxh);
         sum_dxh_xh = subgroupAdd(sum_dxh_xh);
@@ -171,8 +172,7 @@ def make_transformer_kernels(dev):
     K["merge_qkv_grad"] = Elementwise(
         dev, "merge_qkv_grad",
         [("dq", "f32", "readonly"), ("dk", "f32", "readonly"),
-         ("dv", "f32", "readonly"), ("dqkv", "f32", "writeonly"),
-         ("dqkv16", "f16", "writeonly")],
+         ("dv", "f32", "readonly"), ("dqkv16", "f16", "writeonly")],
         """
         uint d = i % p.D;
         uint bt = i / p.D;
@@ -182,9 +182,6 @@ def make_transformer_kernels(dev):
         uint j = d % p.hd;
         uint src = ((b * p.H + h) * p.T + t) * p.hd + j;
         uint dst = bt * 3u * p.D + d;
-        dqkv[dst] = dq[src];
-        dqkv[dst + p.D] = dk[src];
-        dqkv[dst + 2u * p.D] = dv[src];
         dqkv16[dst] = float16_t(dq[src]);
         dqkv16[dst + p.D] = float16_t(dk[src]);
         dqkv16[dst + 2u * p.D] = float16_t(dv[src]);
@@ -206,6 +203,24 @@ def make_transformer_kernels(dev):
         uint chunk = i / p.ncol;
         float s = 0.0;
         for (uint r = chunk; r < p.nrow; r += p.nchunk) s += g[r * p.ncol + col];
+        atomicAdd(sums[col], s);
+        """,
+        push=[("ncol", "uint"), ("nrow", "uint"), ("nchunk", "uint")],
+        extensions=["GL_EXT_shader_atomic_float"])
+
+    # Same reduction over an f16 gradient. Every tensor whose column sum we
+    # need already exists in f16 for the matmuls, so reading f16 here removes
+    # both the f32 duplicate write and half of this kernel's read traffic.
+    # Accumulation stays in f32, so only the inputs lose precision.
+    K["col_sum_chunk16"] = Elementwise(
+        dev, "col_sum_chunk16",
+        [("g", "f16", "readonly"), ("sums", "f32", "")],
+        """
+        uint col = i % p.ncol;
+        uint chunk = i / p.ncol;
+        float s = 0.0;
+        for (uint r = chunk; r < p.nrow; r += p.nchunk)
+            s += float(g[r * p.ncol + col]);
         atomicAdd(sums[col], s);
         """,
         push=[("ncol", "uint"), ("nrow", "uint"), ("nchunk", "uint")],

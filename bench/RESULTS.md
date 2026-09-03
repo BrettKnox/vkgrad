@@ -567,3 +567,36 @@ Priced optimisations, not yet implemented:
 |---|---|---|
 | drop duplicated f32 gradient buffers (`dz32`, `dqkv32`) | ~80 MiB | ~5% |
 | f16 accumulation for attention scores and dP | ~59 MiB | ~4% |
+
+
+## 29. Predicted, built, verified: dropping the duplicated f32 gradients
+
+Every tensor needing a column sum for a bias gradient already exists in f16 for
+the matmuls. The f32 copies (`dz32`, `dqkv32`, f32 `dyxh`) existed only so the
+reduction could read f32. `col_sum` now reads f16 and still accumulates in f32.
+
+Predicted before implementing, from shapes alone: ~81 MiB, ~1.0 ms, **4.7%**.
+
+Measured by alternating old and new code in time, six rounds each, from a git
+worktree at the previous commit:
+
+```
+old  21.52  21.46  23.13  21.43  21.66  22.34   median 21.59 ms
+new  20.33  20.53  20.40  20.37  20.41  21.10   median 20.41 ms
+```
+
+| | predicted | actual | error |
+|---|---|---|---|
+| bytes saved | 81 MiB | 82.9 MiB | 2.3% |
+| time saved | 1.02 ms | 1.19 ms | 16% |
+| step speedup | 4.7% | **5.5%** | |
+
+Traffic totals: amplified 1174.4 -> 1091.5 MiB untuned.
+
+Unpredicted side effects, both good. Timing became much more stable (1% spread
+versus 7.8%), consistent with less pressure on a memory controller shared with
+the CPU. Gradient accuracy was unchanged, worst 2.64e-03 vs 2.53e-03, since only
+the reduction's inputs were narrowed.
+
+Tuned step after the change: **17.52 ms**, versus a traffic-only prediction of
+17.35 ms, error **-1.0%**.
