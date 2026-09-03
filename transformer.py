@@ -23,8 +23,8 @@ NCHUNK = 32  # row chunks for the column-sum reduction
 class TCtx(Ctx):
     """Ctx plus the transformer kernels."""
 
-    def __init__(self, dev, tune=False):
-        super().__init__(dev, tune)
+    def __init__(self, dev, tune=False, scalar_only=None):
+        super().__init__(dev, tune, scalar_only)
         self.TK = make_transformer_kernels(dev)
 
     def col_sum(self, src, dst, ncol, nrow, graph=None, f16=True):

@@ -7,8 +7,9 @@ cores) is already used for inference by llama.cpp and ncnn. Nothing runs a
 **backward pass** on it. This does.
 
 Target: any GPU with a Vulkan 1.1 driver. Cooperative matrix is used when the
-device has it and a scalar fallback runs when it does not, which costs about 6%
-on a real training step rather than the 2.9x the peak numbers imply. Developed
+device has it and a scalar fallback runs when it does not, which costs between
+-5% and +18% depending on model shape (median ~8%) rather than the 2.9x the peak
+numbers imply. Developed
 against an AMD Radeon 780M (RDNA3 iGPU, 12 CU) under Windows, where ROCm does
 not officially reach.
 

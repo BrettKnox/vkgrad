@@ -44,15 +44,19 @@ def pick_config(m, n, k, trans_a=False, trans_b=False, min_groups=12):
 class Ctx:
     """Owns the device, the compiled kernels, and a matmul cache keyed by shape."""
 
-    def __init__(self, dev, tune=False):
+    def __init__(self, dev, tune=False, scalar_only=None):
         self.dev = dev
         self.K = make_kernels(dev)
         self.tune = tune
         # Devices without VK_KHR_cooperative_matrix (Polaris, Vega, Pascal,
         # Maxwell, pre-Arc Intel, Adreno, Mali, Raspberry Pi) still train, just
         # on the scalar path. VKGRAD_NO_COOPMAT=1 forces it for testing.
-        self.scalar_only = (not dev.has_coop_matrix
-                            or os.environ.get("VKGRAD_NO_COOPMAT") == "1")
+        # Explicit override lets both paths coexist in one process, which is
+        # the only way to compare them interleaved rather than across runs.
+        if scalar_only is None:
+            scalar_only = (not dev.has_coop_matrix
+                           or os.environ.get("VKGRAD_NO_COOPMAT") == "1")
+        self.scalar_only = scalar_only or not dev.has_coop_matrix
         self._mm = {}
         self._owned = []
 

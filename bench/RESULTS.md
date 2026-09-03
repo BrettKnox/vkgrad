@@ -1200,3 +1200,31 @@ faster; the atomic path remains for multi-device.
 
 Eighth correction in this document, and the second of the same two kinds:
 comparing across runs, and generalising from a single configuration.
+
+
+## 45. Audit: the matrix-unit claim was measured the wrong way
+
+"Matrix units are worth ~6%" is the most quoted result here, and it came from
+comparing two separate `charlm` runs. That is the cross-run error this document
+has made four times.
+
+`Ctx` now takes a `scalar_only` override so both paths can exist in one process
+and be alternated. Median of 7, interleaved:
+
+| model | coopmat | scalar | matrix units worth |
+|---|---|---|---|
+| 1.8M (192d x4) | 20.9 ms | 22.0 ms | +5.4% |
+| 10.8M (384d x6) | 90.5 ms | 106.6 ms | +17.8% |
+| 25.4M (512d x8) | 124.5 ms | 118.7 ms | **-4.7%** |
+| 85.4M (768d x12) | 195.7 ms | 220.8 ms | +12.8% |
+| 162M (768d x12, vocab 50k) | 255.5 ms | 275.4 ms | +7.8% |
+
+Range -5% to +18%, median about 8%, no clean trend with size, and one shape
+where the scalar path wins outright because the two tile choosers pick
+differently.
+
+The published "~6%" was too precise and slightly low. The qualitative
+conclusion is unchanged and now rests on five model sizes instead of one:
+training without matrix units costs far less than the 2.9x peak ratio implies.
+
+Ninth correction. Same cause as the first, third, sixth and eighth.

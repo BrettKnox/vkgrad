@@ -653,12 +653,46 @@ And on actual training, with `VKGRAD_NO_COOPMAT=1` forcing the scalar path:
 | gradient checks | pass | pass | none |
 
 **Matrix units are worth about 6% on a real training step here.** Not 2.9x.
+(That 6% was measured across separate runs and is corrected below: interleaved,
+the range is -5% to +18% with a median near 8%.)
 
 The reason is the whole thesis of this document. A bandwidth-bound machine
 leaves the matrix units idle most of the time, so removing them removes
 capacity that was not being used. Section 2.9 measured that directly: the step
 runs at the DRAM limit with a ~10% non-bandwidth residue, and matrix throughput
 lives entirely inside that residue.
+
+### Audit: re-measured interleaved
+
+The 6% figure above came from comparing two separate `charlm` runs, which is the
+cross-run error this document has now made four times. Re-measured properly, by
+constructing both a cooperative-matrix and a scalar context in one process and
+alternating their steps, median of 7:
+
+| model | coopmat | scalar | matrix units worth |
+|---|---|---|---|
+| 1.8M (192d x4) | 20.9 ms | 22.0 ms | +5.4% |
+| 10.8M (384d x6) | 90.5 ms | 106.6 ms | **+17.8%** |
+| 25.4M (512d x8) | 124.5 ms | 118.7 ms | **-4.7%** |
+| 85.4M (768d x12) | 195.7 ms | 220.8 ms | +12.8% |
+| 162M (768d x12, vocab 50k) | 255.5 ms | 275.4 ms | +7.8% |
+
+**Somewhere between -5% and +18%, median around 8%, with no clean trend.** On one
+shape the scalar path is faster, because `pick_config` and `pick_scalar` choose
+tiles independently and some shapes suit the scalar tiling better.
+
+So "about 6%" was too precise and slightly low. The correct statement is that
+matrix units are worth a modest, shape-dependent amount, occasionally nothing.
+
+Note also the gap between levels. On isolated matmuls cooperative matrix is 1.22x
+to 2.19x faster; end to end it is worth under 20%. That difference is the whole
+thesis of this document restated: on a bandwidth-bound machine, matmul speedups
+do not become step speedups.
+
+The conclusion that matters is unchanged, and if anything better supported by
+having five model sizes rather than one: **training without matrix units costs
+well under the 2.9x the peak FLOPS ratio implies**, so the hardware floor for
+this work is far lower than the marketing suggests.
 
 This is the most consequential result here, and it is worth stating plainly
 because it cuts against how the hardware is marketed. Tensor cores are sold as
