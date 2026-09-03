@@ -1,10 +1,15 @@
 # Training neural networks on a consumer iGPU through Vulkan
 
 **What this is.** A complete training stack, built from nothing but Python's
-`ctypes` and a shader compiler, that runs forward pass, backward pass and
-optimiser on AMD's matrix cores through Vulkan compute. It trains MNIST to
-97.69% and a 1.84M parameter transformer, on an integrated GPU under Windows,
-where ROCm does not officially reach.
+`ctypes` and a shader compiler, running forward pass, backward pass and
+optimiser through Vulkan compute on an integrated GPU under Windows, where ROCm
+does not officially reach.
+
+It trains MNIST to 97.69%, trains a 10.8M-parameter transformer to a real loss
+curve in twelve minutes, fits and trains **315M parameters** in 7.3 GiB, and
+runs GPT-2 small's architecture at 1,117 tokens/s. It needs no matrix units
+(they are worth about 6%), and its multi-device gradient exchange needs no
+NCCL.
 
 **Why it might matter.** CUDA is the only mature training stack. Everything
 else is inference-only or vendor-locked. Vulkan's `cooperative_matrix`
@@ -43,7 +48,7 @@ selection are second-order until byte traffic is already minimal. Every design
 decision below follows from that, and several of them contradict what a CUDA
 background would suggest.
 
-## 2. Five results
+## 2. Ten results about this hardware
 
 ### 2.1 Unified memory does not mean "never copy"
 
@@ -667,11 +672,150 @@ It is any GPU with a Vulkan 1.1 driver. The runtime detects
 `VK_KHR_cooperative_matrix` and uses it when present, falls back automatically
 when absent, and trains either way.
 
-## 6. What this cost, and what it needs
+## 6. Portability was assumed four times and was wrong four times
 
-The whole stack is **2,799 lines of Python** for the runtime, kernels, autograd
-and transformer, plus 1,466 more for tests, benchmarks and examples, plus the
-GLSL it generates. Dependencies:
+Sections 4 and 5 claim this runs on hardware other than the machine it was
+written on. That claim was made three separate times before it was true, and
+each time the checking found something that would have broken on real hardware.
+The four bugs are worth listing together, because the pattern matters more than
+any of them.
+
+**Unconditional feature requests.** `vkCreateDevice` was asked for 15 features
+without checking support, and Vulkan fails device creation outright if any is
+unsupported. On a Vulkan 1.1 GPU (GTX 1060, RX 580, Intel HD 620) nothing would
+have run. Seven of the fifteen were not used by any kernel; they were requested
+because they looked useful. The runtime now queries
+`vkGetPhysicalDeviceFeatures2` and asks only for the intersection.
+
+**Hardcoded subgroup width.** The row-reduction kernels stride a row across one
+subgroup's lanes, so the stride must equal the real subgroup width. It was
+fixed at 32 next to a `requiredSubgroupSize=32` request that AMD happens to
+grant. Mismatching them does not crash: on a 192-wide row, a width-64 subgroup
+with a stride of 32 gives **84% error**, silently. Intel's subgroups are
+commonly 8, 16 or 32; older AMD is 64; devices without `subgroupSizeControl`
+ignore the request entirely. All of them would have trained on quietly corrupt
+gradients.
+
+**Hardcoded dispatch multiplier.** Found while fixing the previous one. The row
+kernels were dispatched as `rows * 32`, so at width 64 only half the rows were
+processed.
+
+**Discrete-only memory selection.** `find_memory_type` required the `device`
+role to be `DEVICE_LOCAL` and *not* `HOST_VISIBLE`, which describes a card with
+private VRAM. A fully unified device (Intel integrated, Apple via MoltenVK,
+Mali, Adreno) exposes no such memory, and since every model buffer defaults to
+that role, the first allocation would have raised.
+
+None of these were found by reading the code. All four were found by building a
+way to *run* the other configuration. There are now three switches for that, and
+all five test suites pass under each and under all three at once:
+
+| configuration | approximates | result |
+|---|---|---|
+| baseline | RDNA3: matrix units, wave32, split heaps | 5/5 |
+| `VKGRAD_NO_COOPMAT=1` | Vega, Pascal, Intel HD: no matrix units | 5/5 |
+| `VKGRAD_NATIVE_SUBGROUP=1` | wave64, no subgroup size control | 5/5 |
+| `VKGRAD_UMA=1` | Intel, Mali, Adreno: unified memory | 5/5 |
+| all three | oldest and most constrained tier | 5/5 |
+
+`check_device.py` reports what a given GPU supports and what each missing piece
+costs, so unsupported hardware produces an explanation rather than a Vulkan
+error code.
+
+This still is not the same as running on another vendor's silicon. It does mean
+each of the four wrong assumptions now has a configuration that would catch it
+again, and that a fifth has somewhere to be caught.
+
+## 7. What can actually be trained on hardware people own
+
+The performance sections above are about ratios. This one is about what a person
+with a laptop can actually do, which is the only question that matters for the
+premise.
+
+### The frontier
+
+Removing an artificial limit came first: `Kernel` allocated a single descriptor
+pool of 64 sets, and a recorded step binds the same kernel once per tensor, so a
+6-layer model failed at construction. Nothing about the hardware required that.
+Pools are chained now.
+
+On a Radeon 780M with 12 CUs and unified DDR5-5600:
+
+| params | step | tokens/s | memory |
+|---|---|---|---|
+| 1.8 M | 20.2 ms | 101,593 | 0.33 GiB |
+| 10.8 M | 89.1 ms | 22,984 | 1.15 GiB |
+| 25.4 M | 225.5 ms | 9,083 | 2.13 GiB |
+| 85.4 M | 801.1 ms | 2,556 | 5.26 GiB |
+| **315.4 M** | 803.2 ms | 637 | **7.31 GiB** |
+
+**315 million parameters trains on an integrated GPU**, in 7.3 of 11.8 GiB. Full
+forward, backward and AdamW, gradients verified against numpy.
+
+### A real run, not an extrapolation
+
+Step times are not throughput. A 12-minute run of the 10.8M model with real data
+loading, loss readback, held-out validation and checkpointing:
+
+```
+7,518 steps, 15.4M tokens, 21,382 tokens/s sustained
+loss 4.7821 -> 0.8717,  validation 0.9123
+```
+
+No thermal decay: instantaneous throughput over the final six minutes (21,672)
+is above the cumulative average. The step-time extrapolation was about 7%
+optimistic.
+
+Sampling from that checkpoint, primed with real corpus text:
+
+```python
+def filter(pad, pad, pad, pad, pad, pad, pad, pad, pad, pad)
+        self.assertEqual(self.rowcode, pad, pad)
+        self.rowcode = rowcode
+
+    def test_pad(self):
+        self.rowcode = self.rowcode
+```
+
+Block structure, consistent indentation, `self.` access, the `test_` convention
+and `assertEqual`, correctly inferring from context that it was inside a
+unittest file. Repetitive, because this is 7% of Chinchilla-optimal. Twelve
+minutes, no CUDA, no ROCm, no downloaded dataset.
+
+### Fine-tuning scale
+
+Most people would fine-tune rather than train from scratch. GPT-2 small's
+architecture (768 d_model, 12 layers, 12 heads, vocab 50257, learned positions,
+pre-LayerNorm, GELU) is what this already builds:
+
+**1,117 tokens/s in 3.92 GiB.** That is 1M tokens in 15 minutes, 10M in 2.5
+hours, 50M in 12.4 hours. Domain adaptation on a laptop is a matter of hours.
+
+(Measured with random weights. Loading real GPT-2 checkpoints would also need
+the weight file, a BPE tokenizer, and embedding/head weight tying, none of which
+is implemented. The throughput and memory are what a fine-tune would see.)
+
+### Bigger batches are slower, which inverts standard practice
+
+| batch | tokens/s |
+|---|---|
+| 2 | 1,117 |
+| 4 | 844 |
+| 8 | 668 |
+
+On discrete NVIDIA hardware you raise batch size to amortise weight reads and
+fill idle compute. Neither applies here: there is no idle compute, because the
+machine is bandwidth-bound, and activation traffic grows linearly with batch
+while the fixed weight traffic was never the bottleneck. Tuning intuition ported
+from a discrete card gets this exactly backwards, and the failure mode looks
+like broken hardware rather than a wrong assumption.
+
+## 8. What this cost, and what it needs
+
+The whole stack is **3,542 lines of Python** for the runtime, kernels,
+autograd, transformer, scalar fallback and multi-device collective, plus the
+rest of the 6,612 total for tests, benchmarks and examples, plus the GLSL it
+generates. Dependencies:
 numpy, and `glslc` from the Vulkan SDK. No C compiler, no Rust, no vendor
 bindings, no PyTorch. Vulkan is driven directly through `ctypes`.
 
@@ -691,11 +835,18 @@ The transformer check covers causal attention, LayerNorm, both attention
 transposes, residual branches, and the embedding scatter-add through
 `VK_EXT_shader_atomic_float`.
 
-## 7. Honest limitations
+## 9. Honest limitations
 
-- **One GPU tested.** Everything here is measured on gfx1103. The code paths
-  are generic Vulkan and the scalar fallback is exercised by the full test
-  suite (`VKGRAD_NO_COOPMAT=1`), but no other physical device has been run.
+- **One GPU tested.** Everything here is measured on gfx1103. Five simulated
+  configurations (section 6) cover the hardware classes claimed, and all five
+  test suites pass under each, but no other physical device has been run. Four
+  portability assumptions were wrong before those simulations existed, which is
+  the best available evidence that a fifth is still hiding.
+- **Seven corrected numbers.** Cold clocks, evaluation order, cross-run
+  comparison, four portability assumptions and a too-short sample each produced
+  a confident figure that later measurement overturned. The corrections are
+  recorded in place rather than overwritten. Treat any number here that is not
+  attached to a described measurement method with suspicion.
 - **Batched attention matmuls remain slow** at 0.6 to 1.0 TFLOPS. The shapes
   are small and awkward (head dim 48 or 64 against a 16-wide tile granularity).
 - **No split-K.** The tall-skinny weight-gradient matmuls (192 x 768 x 2048)
@@ -721,7 +872,7 @@ transposes, residual branches, and the embedding scatter-add through
 - **CPU baselines use numpy/OpenBLAS**, which is a strong but not maximal CPU
   implementation. The transformer CPU baseline counts matmuls only.
 
-## 8. Reproducing
+## 10. Reproducing
 
 ```bash
 python test_runtime.py && python test_kernels.py && python test_autograd.py && python test_transformer.py
