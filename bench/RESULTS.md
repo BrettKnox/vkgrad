@@ -1057,3 +1057,42 @@ state. Two minutes was the new "cold clocks".
 What is not in question: a 10.8M-parameter transformer reaches validation loss
 0.91 on held-out Python source in 12 minutes on an integrated laptop GPU, with
 no CUDA and no ROCm.
+
+
+## 42. What 12 minutes of training on a laptop iGPU produces
+
+A validation loss is abstract. `examples/sample_lm.py` loads the checkpoint and
+generates, which is also the only check that catches a model optimising
+something other than what you intended.
+
+Primed with real corpus text (a tkinter test file), the 10.8M model trained for
+12 minutes continues:
+
+```python
+def filter(pad, pad, pad, pad, pad, pad, pad, pad, pad, pad)
+        self.assertEqual(self.rowcode, pad, pad)
+        self.rowcode = rowcode
+
+    def test_pad(self):
+        self.rowcode = self.rowcode
+        self.do_do_do_do_do_document = self.rowcode
+
+        self.do_document = self._create()
+        self.sock
+```
+
+It has learned Python block structure, consistent 4- and 8-space indentation,
+`self.` attribute access, the `test_` naming convention, and the `assertEqual`
+idiom, and it correctly inferred from context that it was inside a unittest
+file. The repetition is what a 10.8M model looks like at **7% of
+Chinchilla-optimal** (15.4M of 216M tokens).
+
+The first attempt produced 300 `?` characters in a row. That was not the model:
+the sampler left-padded the 256-token window with the unknown token, which
+barely appears in training, so the context was far outside the training
+distribution and the model sensibly continued the padding. Priming with real
+text fixed it. Worth recording because a broken prompt and a broken model look
+identical from the output, and the instinct is to blame the model.
+
+Total cost of this result: an integrated GPU, no CUDA, no ROCm, no downloaded
+dataset, and twelve minutes.

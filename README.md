@@ -53,6 +53,8 @@ check_device.py    will vkgrad run on this GPU, and what will it get
 examples/mnist.py  trains an MLP, races it against the same model on the CPU
 examples/charlm.py trains a char-level transformer on local text
 examples/ddp_mnist.py  data-parallel MNIST across N devices, no NCCL
+examples/train_lm.py   train a char LM for a wall-clock budget, resumable
+examples/sample_lm.py  generate text from a checkpoint
 bench/roofline.py  bandwidth, dispatch overhead, fp32 and WMMA ceilings
 bench/matmul_sweep.py  matmul throughput vs the CPU baseline
 bench/nightly.ps1  unattended full sweep, records machine load alongside results
