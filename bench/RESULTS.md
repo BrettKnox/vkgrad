@@ -666,3 +666,57 @@ have no swizzled path.
 
 Keep it (free, and large models benefit), but it is not a step-change. This is
 the third time an interleaved A/B has overturned a cross-run number.
+
+
+## 31. int8 cooperative matrix: no compute advantage on RDNA3
+
+int8 matrix units are the most widely available accelerator primitive in
+consumer silicon, so if int8 training were viable it would reach hardware with
+no CUDA and no path to it. Two things decide it, and the issue rate is the
+cheap one to measure. Pure register loop, no memory traffic:
+
+| operands | rate | vs f16 |
+|---|---|---|
+| f16 x f16 -> f32 | 15.30 TOPS | 1.00x |
+| f16 x f16 -> f16 | 15.33 TOPS | 1.00x |
+| i8 x i8 -> i32 | 15.13 TOPS | 0.99x |
+| u8 x u8 -> i32 | 15.13 TOPS | 0.99x |
+
+**Every operand type issues at the same rate.** This contradicts the NVIDIA
+intuition, where int8 tensor cores run at roughly 2x fp16. On RDNA3's WMMA int8
+buys no arithmetic at all.
+
+So int8's only benefit here is halved operand bytes. Operand traffic is 53.7%
+of a step, capping the gain at ~27% before subtracting quantisation overhead
+and accepting backward-pass range problems. Not worth building. Worth knowing
+before anyone plans int8 work on AMD consumer hardware.
+
+## 32. Cross-vendor gradient exchange through imported host memory
+
+Portable kernels are only half of vendor independence. Multi-GPU training runs
+on NCCL, which is NVIDIA-only, so even portable kernels leave the collective
+locked in. There is no cross-vendor equivalent.
+
+`VK_EXT_external_memory_host` is a way around it, and this device supports it
+(minimum import alignment 4096 bytes). Ordinary host memory can be imported by
+several independent VkDevices at once, making plain system RAM a shared arena
+between GPUs. Nothing about it requires the devices to share a vendor, a
+driver, or an interconnect.
+
+Verified here:
+
+| check | result |
+|---|---|
+| host allocation imported, GPU writes visible to the CPU | OK |
+| two independent VkDevices sharing one allocation | OK (3 + 4 = 7) |
+| 2-worker gradient sum over shared memory | OK, 256 KiB, **0 bytes transferred** |
+
+On unified memory the arena is the same DRAM the GPU already reads, so the
+all-reduce degenerates into both workers adding into the same bytes: the
+cheapest possible collective. On a discrete card it is the host side of that
+card's PCIe path.
+
+Scope note: these run two VkDevices from the one physical GPU available here.
+That validates the mechanism (independent devices, independent queues, one
+shared allocation, writes visible both ways). It does not demonstrate two
+vendors, which needs hardware this machine does not have.

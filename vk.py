@@ -51,6 +51,12 @@ ST_PIPELINE_EXECUTABLE_PROPERTIES_KHR = 1000269002
 ST_PIPELINE_EXECUTABLE_INFO_KHR = 1000269003
 ST_PIPELINE_EXECUTABLE_STATISTIC_KHR = 1000269004
 
+ST_EXTERNAL_MEMORY_BUFFER_CI = 1000072001
+ST_IMPORT_MEMORY_HOST_POINTER_INFO_EXT = 1000178000
+ST_MEMORY_HOST_POINTER_PROPERTIES_EXT = 1000178001
+ST_PHYS_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT = 1000178002
+EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT = 0x80
+
 PIPELINE_CREATE_CAPTURE_STATISTICS = 0x40
 MAX_SETS_PER_KERNEL = 64
 
@@ -422,6 +428,25 @@ class FenceCI(C.Structure):
     _fields_ = [("sType", C.c_uint32), ("pNext", C.c_void_p), ("flags", C.c_uint32)]
 
 
+class ExternalMemoryBufferCI(C.Structure):
+    _fields_ = [("sType", C.c_uint32), ("pNext", C.c_void_p), ("handleTypes", C.c_uint32)]
+
+
+class ImportMemoryHostPointerInfo(C.Structure):
+    _fields_ = [("sType", C.c_uint32), ("pNext", C.c_void_p),
+                ("handleType", C.c_uint32), ("pHostPointer", C.c_void_p)]
+
+
+class MemoryHostPointerProperties(C.Structure):
+    _fields_ = [("sType", C.c_uint32), ("pNext", C.c_void_p),
+                ("memoryTypeBits", C.c_uint32)]
+
+
+class ExternalMemoryHostProps(C.Structure):
+    _fields_ = [("sType", C.c_uint32), ("pNext", C.c_void_p),
+                ("minImportedHostPointerAlignment", C.c_uint64)]
+
+
 class BufferCopy(C.Structure):
     _fields_ = [("srcOffset", C.c_uint64), ("dstOffset", C.c_uint64), ("size", C.c_uint64)]
 
@@ -444,21 +469,62 @@ class Buffer:
     """A GPU storage buffer. If host-visible, .array() is a live numpy view of
     the same bytes the GPU reads: no copies, ever."""
 
-    def __init__(self, dev, size, kind="shared", usage=None):
+    def __init__(self, dev, size, kind="shared", usage=None, host_ptr=None):
         self.dev = dev
         self.size = size
         self.kind = kind
+        self.host_ptr = host_ptr
         usage = usage if usage is not None else (BUF_STORAGE | BUF_TRANSFER_SRC | BUF_TRANSFER_DST)
+        self._keep = []
 
-        ci = BufferCI(ST_BUFFER_CI, None, 0, size, usage, 0, 0, None)
+        ext = None
+        pnext = None
+        if host_ptr is not None:
+            ext = ExternalMemoryBufferCI(ST_EXTERNAL_MEMORY_BUFFER_CI, None,
+                                         EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT)
+            pnext = C.cast(C.pointer(ext), C.c_void_p)
+            self._keep.append(ext)
+        ci = BufferCI(ST_BUFFER_CI, pnext, 0, size, usage, 0, 0, None)
         self.buf = C.c_void_p()
         _check(_lib.vkCreateBuffer(dev.dev, C.byref(ci), None, C.byref(self.buf)),
                "vkCreateBuffer")
 
         req = MemReq()
         _lib.vkGetBufferMemoryRequirements(dev.dev, self.buf, C.byref(req))
-        self.mem_type = dev.find_memory_type(req.memoryTypeBits, kind)
-        ai = MemAllocInfo(ST_MEMORY_ALLOCATE_INFO, None, req.size, self.mem_type)
+
+        if host_ptr is not None:
+            fn = dev._proc("vkGetMemoryHostPointerPropertiesEXT")
+            if not fn:
+                raise VkError("vkGetMemoryHostPointerPropertiesEXT unavailable")
+            F = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_uint32, C.c_void_p, C.c_void_p)(fn)
+            hp = MemoryHostPointerProperties(ST_MEMORY_HOST_POINTER_PROPERTIES_EXT, None, 0)
+            _check(F(dev.dev, EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                     C.c_void_p(host_ptr), C.byref(hp)),
+                   "vkGetMemoryHostPointerPropertiesEXT")
+            bits = req.memoryTypeBits & hp.memoryTypeBits
+            if not bits:
+                raise VkError("no memory type can import this host pointer")
+            # Prefer a host-coherent type so both sides see writes without
+            # explicit flushes.
+            self.mem_type = None
+            for i in range(dev.mem_props.memoryTypeCount):
+                if not (bits & (1 << i)):
+                    continue
+                f = dev.mem_props.memoryTypes[i].propertyFlags
+                if f & MEM_HOST_VISIBLE and f & MEM_HOST_COHERENT:
+                    self.mem_type = i
+                    break
+            if self.mem_type is None:
+                self.mem_type = (bits & -bits).bit_length() - 1
+            imp = ImportMemoryHostPointerInfo(
+                ST_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, None,
+                EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, C.c_void_p(host_ptr))
+            self._keep.append(imp)
+            ai = MemAllocInfo(ST_MEMORY_ALLOCATE_INFO,
+                              C.cast(C.pointer(imp), C.c_void_p), req.size, self.mem_type)
+        else:
+            self.mem_type = dev.find_memory_type(req.memoryTypeBits, kind)
+            ai = MemAllocInfo(ST_MEMORY_ALLOCATE_INFO, None, req.size, self.mem_type)
         self.mem = C.c_void_p()
         _check(_lib.vkAllocateMemory(dev.dev, C.byref(ai), None, C.byref(self.mem)),
                "vkAllocateMemory")
@@ -856,7 +922,8 @@ class Device:
                 "VK_KHR_shader_float16_int8", "VK_KHR_16bit_storage",
                 "VK_KHR_8bit_storage", "VK_KHR_pipeline_executable_properties",
                 "VK_EXT_memory_budget", "VK_EXT_memory_priority",
-                "VK_EXT_shader_atomic_float"]
+                "VK_EXT_shader_atomic_float", "VK_EXT_external_memory_host",
+                "VK_KHR_external_memory"]
         self.enabled_extensions = [e for e in want if e in self.extensions]
         ext_ptr, ext_n, keep_ext = _strings(self.enabled_extensions)
 
@@ -982,6 +1049,29 @@ class Device:
             if (f & required) == required and not (f & forbidden):
                 return i
         raise VkError(f"no memory type for kind={kind!r} (type_bits=0x{type_bits:x})")
+
+    def host_pointer_alignment(self):
+        """Alignment an imported host allocation must satisfy, or None if this
+        device cannot import host memory."""
+        if "VK_EXT_external_memory_host" not in self.extensions:
+            return None
+        props = ExternalMemoryHostProps(ST_PHYS_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT, None)
+        head = Properties2Head(ST_PHYS_PROPERTIES_2, C.cast(C.pointer(props), C.c_void_p))
+        _lib.vkGetPhysicalDeviceProperties2(self.phys, C.byref(head))
+        return int(props.minImportedHostPointerAlignment)
+
+    def import_host_buffer(self, ptr, size, usage=None):
+        """Wrap an existing host allocation as a GPU buffer, without copying.
+
+        The same host pointer can be imported by several independent VkDevices,
+        including devices from different vendors. That makes plain system memory
+        a shared arena between GPUs: on unified memory it is literally the same
+        DRAM, and elsewhere it is the host side of each device's PCIe path.
+
+        This is the primitive a cross-vendor gradient exchange needs, and it
+        requires no vendor interconnect, no NCCL, and no common driver stack.
+        """
+        return Buffer(self, size, kind="imported", usage=usage, host_ptr=ptr)
 
     def shader_core_props(self):
         """CU counts and register file sizes, or None on non-AMD drivers."""
