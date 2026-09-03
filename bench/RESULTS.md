@@ -1426,3 +1426,72 @@ under 20% end to end, flat across five model sizes. An 8.5% tile-selection
 regret is worth perhaps 1-2% of a training step. Several iterations have now
 gone into this autotuner, which is precisely the failure mode this file
 documents elsewhere. The bytes moved are the lever; the tuner is not.
+
+## 49. The driver does use the matrix units, and the backward pass costs 64% more registers
+
+The largest open number in this project was ~3 TFLOPS against a nominal ~17
+TFLOPS f16 peak. Two hypotheses could explain a 5x gap without any data-reuse
+problem, and both are now dead:
+
+  * *The driver emulates cooperative matrix.* If `VK_KHR_cooperative_matrix`
+    lowered to scalar FMA rather than hardware WMMA, the matrix units would
+    never be touched and no tiling would help.
+  * *The kernels spill registers.* Spilling round-trips through memory, which on
+    a bandwidth-bound machine is fatal.
+
+`bench/isa.py` settles both offline, with no GPU and no profiler GUI, by
+compiling SPIR-V to RDNA3 ISA with Radeon GPU Analyzer 2.14.2 targeting gfx1103
+(which RGA names "AMD Radeon 780M Graphics" -- the exact part).
+
+| variant | v_wmma | scalar fma | VGPRs | LDS | spills |
+|---|---|---|---|---|---|
+| forward | 8 | 0 | 76 | 0 | 0 |
+| trans_a (dW) | 8 | 0 | **125** | 0 | 0 |
+| trans_b (dX) | 8 | 0 | 75 | 0 | 0 |
+| batched | 8 | 0 | **125** | 0 | 0 |
+| swizzled | 8 | 0 | 76 | 0 | 0 |
+
+The instruction is `v_wmma_f32_16x16x16_f16` in every case, eight per kernel,
+with zero scalar FMA and zero scratch memory. **The driver honours cooperative
+matrix, including on both transposed backward paths.** A deep-research report
+asserted the opposite -- that the Windows driver was "almost certainly falling
+back to non-WMMA emulation or scalar LDS fetching" on transposed operands. It is
+not. The SPIR-V is also identical in matrix-op count across all five variants,
+so nothing is degraded during compilation either.
+
+So the gap is neither emulation nor spilling. What remains is data reuse, and
+the repo's own model already says so: `Matmul.traffic_bytes` charges
+`reads_a = m*k*2*(n/bn)`, which at `bn=64` and `n=1024` re-reads every element of
+A sixteen times. A square matmul has arithmetic intensity `K/4`, so clearing the
+~200 FLOP/byte ridge point needs `K >= 803` -- 1024^3 *should* be compute-bound
+and measures ~3.2 TFLOPS. It is not reaching `K/4` because the tiling does not
+let it.
+
+### The unplanned finding: transposed kernels are register-hungry
+
+The dW kernel uses **125 VGPRs against the forward kernel's 76**, a 64%
+increase, with identical tile parameters (sg=4, wm=2, wn=4). Batched is also
+125. At the granularity `occupancy()` uses, that is a drop from roughly 12 to 8
+waves per SIMD on the kernel shape that dominates the backward pass, which is
+two thirds of a training step.
+
+This offers the first mechanical explanation for section 24's anomaly, where the
+traffic model predicted forward matmuls well (rho +0.76) and failed on exactly
+the transposed dW shapes (rho near zero or negative). Traffic alone cannot
+predict a kernel whose occupancy regime differs, and now there is a measured
+reason why those shapes differ.
+
+Two consequences worth acting on:
+
+  * `occupancy()` currently reads VGPR counts from the driver at runtime via
+    `VK_AMD_shader_core_properties`, which makes the pruner AMD-only and, per
+    RESEARCH.md, "undertuned, rejecting only 2 of 84 candidates". RGA supplies
+    the same numbers **offline, for any target architecture**, without owning
+    the hardware. The autotune search space could be pruned for a GPU that is
+    not present.
+  * Register pressure on the transposed path is now a named, measurable target
+    rather than a suspicion.
+
+Cost of this entire result: one 227 MB download and about ten minutes. It should
+have been the first thing done about the 3 TFLOPS question rather than the
+tenth.

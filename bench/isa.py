@@ -111,25 +111,48 @@ def probe_isa(rga, rows, arch="gfx1103"):
 
     This is the half that decides whether the matrix units are used at all.
     """
-    print(f"\n{'variant':<12}{'v_wmma':>8}{'scalar fma':>12}   verdict")
-    print("-" * 52)
+    print(f"\n{'variant':<12}{'v_wmma':>8}{'scalar fma':>12}{'vgpr':>7}"
+          f"{'lds':>8}   verdict")
+    print("-" * 62)
     for name, (spv, _) in rows.items():
-        d = os.path.join(OUT, name.replace(" ", "_") + f".{arch}.isa")
+        tag = name.replace(" ", "_")
+        d = os.path.join(OUT, f"{tag}.{arch}.isa")
+        a = os.path.join(OUT, f"{tag}.{arch}.csv")
         r = subprocess.run(
-            [rga, "-s", "vk-spv-offline", "-c", arch, "--isa", d, "-s", spv],
+            [rga, "-s", "vk-spv-offline", "-c", arch,
+             "--isa", d, "-a", a, "--comp", spv],
             capture_output=True, text=True)
         text = ""
-        for f in glob.glob(d + "*"):
-            with open(f, errors="ignore") as fh:
-                text += fh.read()
+        for f in glob.glob(os.path.join(OUT, f"*{tag}*")):
+            if f.endswith((".isa", ".txt")) or ".isa" in os.path.basename(f):
+                with open(f, errors="ignore") as fh:
+                    text += fh.read()
         if not text:
-            print(f"{name:<12}   RGA produced no ISA: "
-                  f"{(r.stderr or r.stdout)[:80]}")
+            msg = (r.stderr or r.stdout).strip().replace("\n", " ")
+            print(f"{name:<12}   RGA produced no ISA: {msg[:70]}")
             continue
         w, s = len(_WMMA.findall(text)), len(_SCALAR_FMA.findall(text))
-        verdict = ("matrix units used" if w else
-                   "EMULATED, matrix units never touched")
-        print(f"{name:<12}{w:>8}{s:>12}   {verdict}")
+        stat = {}
+        for f in glob.glob(os.path.join(OUT, f"*{tag}*.csv")):
+            with open(f, errors="ignore") as fh:
+                head, *body = fh.read().splitlines()
+            if body:
+                stat = dict(zip([c.strip() for c in head.split(",")],
+                                [v.strip() for v in body[0].split(",")]))
+        vgpr = stat.get("USED_VGPRs", "?")
+        lds = stat.get("USED_LDS_BYTES", "?")
+        # Spills mean the kernel ran out of registers and is round-tripping
+        # through memory, which on a bandwidth-bound machine is the difference
+        # between a fast kernel and a hopeless one.
+        spill = int(stat.get("VGPR_SPILLS", 0) or 0)
+        scratch = int(stat.get("SCRATCH_MEM", 0) or 0)
+        if not w:
+            verdict = "EMULATED -- matrix units never touched"
+        elif spill or scratch:
+            verdict = f"matrix units used, but SPILLING ({spill} vgpr)"
+        else:
+            verdict = "matrix units used, no spills"
+        print(f"{name:<12}{w:>8}{s:>12}{vgpr:>7}{lds:>8}   {verdict}")
 
 
 def main():
