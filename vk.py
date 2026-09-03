@@ -849,6 +849,7 @@ class Device:
         self._create_instance(validate)
         self._pick_physical()
         self._create_device()
+        self.memory_tier = {}
         self._init_subgroup_plan()
         self._create_pools()
 
@@ -1100,24 +1101,54 @@ class Device:
                             scope=SCOPE.get(x.scope, x.scope)))
         return out
 
+    # Ordered preference per role, most specific first, each entry
+    # (required flags, forbidden flags). The last entry of every list is
+    # deliberately permissive.
+    #
+    # The strict forms describe a discrete GPU with separate VRAM. A fully
+    # unified device (Intel integrated, Apple via MoltenVK, Mali, Adreno, some
+    # AMD APU configurations) exposes NO memory that is device-local and not
+    # host-visible, so demanding that outright makes every allocation fail and
+    # the framework dead on arrival there.
     KINDS = {
-        # name      required flags                                    forbidden
-        "device": (MEM_DEVICE_LOCAL, MEM_HOST_VISIBLE),
-        "shared": (MEM_HOST_VISIBLE | MEM_HOST_COHERENT, MEM_HOST_CACHED),
-        "cached": (MEM_HOST_VISIBLE | MEM_HOST_CACHED, 0),
-        "bar":    (MEM_DEVICE_LOCAL | MEM_HOST_VISIBLE, 0),
+        "device": [(MEM_DEVICE_LOCAL, MEM_HOST_VISIBLE),   # discrete VRAM
+                   (MEM_DEVICE_LOCAL, 0),                  # unified: still local
+                   (0, 0)],                                # anything at all
+        "shared": [(MEM_HOST_VISIBLE | MEM_HOST_COHERENT, MEM_HOST_CACHED),
+                   (MEM_HOST_VISIBLE | MEM_HOST_COHERENT, 0),
+                   (MEM_HOST_VISIBLE, 0)],
+        "cached": [(MEM_HOST_VISIBLE | MEM_HOST_CACHED, 0),
+                   (MEM_HOST_VISIBLE | MEM_HOST_COHERENT, 0),
+                   (MEM_HOST_VISIBLE, 0)],
+        "bar":    [(MEM_DEVICE_LOCAL | MEM_HOST_VISIBLE, 0),
+                   (MEM_HOST_VISIBLE, 0)],
+        "imported": [(MEM_HOST_VISIBLE | MEM_HOST_COHERENT, 0),
+                     (MEM_HOST_VISIBLE, 0)],
     }
 
     def find_memory_type(self, type_bits, kind):
+        """Best available memory type for a role, degrading rather than failing.
+
+        Returns the type index; `self.memory_tier[kind]` records which
+        preference level was actually satisfied, so a device that only offers a
+        weaker form is visible rather than silent.
+        """
         if kind not in self.KINDS:
             raise VkError(f"unknown memory kind {kind!r}; use {list(self.KINDS)}")
-        required, forbidden = self.KINDS[kind]
-        for i in range(self.mem_props.memoryTypeCount):
-            if not (type_bits & (1 << i)):
-                continue
-            f = self.mem_props.memoryTypes[i].propertyFlags
-            if (f & required) == required and not (f & forbidden):
-                return i
+        prefs = self.KINDS[kind]
+        if os.environ.get("VKGRAD_UMA") == "1" and kind == "device":
+            # Simulate a fully unified device, where every memory type is
+            # host-visible and none is private VRAM.
+            prefs = [(MEM_DEVICE_LOCAL | MEM_HOST_VISIBLE, 0),
+                     (MEM_HOST_VISIBLE, 0)]
+        for tier, (required, forbidden) in enumerate(prefs):
+            for i in range(self.mem_props.memoryTypeCount):
+                if not (type_bits & (1 << i)):
+                    continue
+                f = self.mem_props.memoryTypes[i].propertyFlags
+                if (f & required) == required and not (f & forbidden):
+                    self.memory_tier[kind] = tier
+                    return i
         raise VkError(f"no memory type for kind={kind!r} (type_bits=0x{type_bits:x})")
 
     def host_pointer_alignment(self):

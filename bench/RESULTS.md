@@ -909,3 +909,51 @@ Third portability claim in this document that did not survive being checked. The
 pattern is now unambiguous: every assumption about hardware not physically
 present has been wrong, and the only thing that has ever caught it is building a
 way to run the other configuration.
+
+
+## 38. Memory selection assumed a discrete GPU
+
+`find_memory_type` matched one exact flag combination per role and raised if
+nothing matched. The `device` role required `DEVICE_LOCAL` and **forbade**
+`HOST_VISIBLE`, which describes a discrete card with private VRAM.
+
+A fully unified device exposes no such memory: on Intel integrated, Apple via
+MoltenVK, Mali, Adreno and some AMD APU configurations, every memory type is
+host-visible. Since every model buffer defaults to `device`, the first
+allocation would have raised and the framework would have been dead on arrival
+on all of them. The same applied to `bar`, which many discrete GPUs without
+resizable BAR do not expose, and to `shared`, which forbade `HOST_CACHED`.
+
+Each role is now an ordered preference list ending in a permissive entry, and
+`Device.memory_tier` records which level was actually satisfied so a weaker
+placement is visible rather than silent:
+
+| role | preferred | then | last resort |
+|---|---|---|---|
+| `device` | device-local, not host-visible | device-local | anything |
+| `shared` | host-visible + coherent, uncached | host-visible + coherent | host-visible |
+| `cached` | host-visible + cached | host-visible + coherent | host-visible |
+| `bar` | device-local + host-visible | host-visible | |
+
+`VKGRAD_UMA=1` simulates a device with no private VRAM by forcing `device` onto
+host-visible memory. Under it, all five suites pass and MNIST still trains to
+96.8%.
+
+## 39. Five-configuration portability matrix
+
+Three simulation switches now cover the hardware classes this project claims to
+support, and the suites run under each:
+
+| configuration | approximates | result |
+|---|---|---|
+| baseline | RDNA3: coopmat, wave32, split heaps | 5/5 |
+| `VKGRAD_NO_COOPMAT=1` | Vega, Pascal, Intel HD: no matrix units | 5/5 |
+| `VKGRAD_NATIVE_SUBGROUP=1` | wave64, no subgroup size control | 5/5 |
+| `VKGRAD_UMA=1` | Intel, Mali, Adreno: unified memory | 5/5 |
+| all three | oldest and most constrained tier | 5/5 |
+
+This does not replace running on real hardware from another vendor. It does mean
+the four assumptions that were found to be wrong (unconditional feature
+requests, hardcoded subgroup stride, hardcoded dispatch multiplier, discrete-only
+memory selection) each now have a configuration that would catch them again, and
+that a fifth assumption of the same kind has somewhere to be caught.

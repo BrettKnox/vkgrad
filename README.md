@@ -85,6 +85,21 @@ python -m bench.matmul_sweep --json bench/matmul.json
 
 Add `--quick` to either for a small, safe run on a busy machine.
 
+Three switches simulate hardware this machine is not, so the portable paths get
+exercised anyway. All five suites pass under each and under all three at once:
+
+```bash
+VKGRAD_NO_COOPMAT=1 python test_transformer.py      # no matrix units
+```
+
+```bash
+VKGRAD_NATIVE_SUBGROUP=1 python test_transformer.py # wave64, no size control
+```
+
+```bash
+VKGRAD_UMA=1 python test_transformer.py             # no private VRAM
+```
+
 Set `VKGRAD_VALIDATE=1` to enable Vulkan validation layers. Do this while
 developing and not while benchmarking: they cost ~30% on submit.
 
