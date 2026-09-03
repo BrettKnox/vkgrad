@@ -6,7 +6,12 @@ The point is not another inference runtime. Vulkan cooperative matrix (matrix
 cores) is already used for inference by llama.cpp and ncnn. Nothing runs a
 **backward pass** on it. This does.
 
-Target: any GPU with a Vulkan 1.1 driver. Cooperative matrix is used when the
+Target: any GPU with a Vulkan 1.1 driver — **claimed, not yet demonstrated.**
+The runtime negotiates features down to 1.1, but `compile.py` currently emits
+SPIR-V targeting Vulkan 1.3, and every shader here has only ever run on one
+physical GPU. Lowering the target changes the emitted binary for every shader,
+so it is a measured change and not a flag flip. Treat this line as an intention
+until a 1.1 device has run the test suite. Cooperative matrix is used when the
 device has it and a scalar fallback runs when it does not, which costs between
 -5% and +18% depending on model shape (median ~8%) rather than the 2.9x the peak
 numbers imply. Developed

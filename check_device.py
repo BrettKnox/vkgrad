@@ -18,7 +18,8 @@ CHECKS = [
     ("f16 arithmetic", "shaderFloat16",
      "f16 math in shaders", True),
     ("cooperative matrix", "cooperativeMatrix",
-     "matrix units. Worth ~6% here; the scalar path runs without it", False),
+     "matrix units. Worth -5% to +18% depending on shape (RESULTS.md sec 45); "
+     "the scalar path runs without it", False),
     ("subgroup size control", "subgroupSizeControl",
      "wave32 for cooperative matrix; unused on the scalar path", False),
     ("float atomics", "shaderBufferFloat32AtomicAdd",

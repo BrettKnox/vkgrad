@@ -157,11 +157,13 @@ class GradAccum:
     workers separated in time rather than across devices: each microbatch adds
     its gradients into an arena, and the optimiser steps once from the sum.
 
-    It matters more here than on a discrete GPU. Throughput on this hardware
-    *falls* as batch grows (1,117 to 668 tokens/s from batch 2 to 8 at GPT-2
-    scale) because the machine is bandwidth-bound and activation traffic scales
-    with batch. So a large effective batch is cheaper as many small microbatches
-    than as one large batch, which is the opposite of the usual advice.
+    When it helps is narrower than first reported, and the original claim here
+    was retracted twice. Throughput does NOT fall monotonically with batch: it
+    is flat and then collapses once the working set passes the memory ceiling
+    (956, 965, 669 tokens/s at batch 2, 4, 8 at GPT-2 scale; RESULTS.md sec 46).
+    So accumulation pays only for models near that ceiling -- 54% faster at
+    162M, and 32% *slower* at 10.8M (sec 44). It is conventional advice after
+    all, not an inversion of it.
     """
 
     def __init__(self, ctx, params, accum=1):

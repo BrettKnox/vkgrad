@@ -704,9 +704,15 @@ bandwidth, and a 2016 GPU with no matrix units at all is far more competitive
 for this than its spec sheet suggests.
 
 The practical consequence: vkgrad's hardware target is not "RDNA3, Turing, Arc".
-It is any GPU with a Vulkan 1.1 driver. The runtime detects
+It is intended to be any GPU with a Vulkan 1.1 driver. The runtime detects
 `VK_KHR_cooperative_matrix` and uses it when present, falls back automatically
 when absent, and trains either way.
+
+That target remains **unverified**, and stating it as fact was the same mistake
+as the four portability assumptions below. `compile.py` emits SPIR-V targeting
+Vulkan 1.3 for every shader; lowering it to 1.1 changes the emitted binary in
+all four shader families, so it is a measured change rather than a flag flip.
+No 1.1 device has run anything here.
 
 ## 6. Portability was assumed four times and was wrong four times
 
@@ -881,16 +887,19 @@ transposes, residual branches, and the embedding scatter-add through
   test suites pass under each, but no other physical device has been run. Four
   portability assumptions were wrong before those simulations existed, which is
   the best available evidence that a fifth is still hiding.
-- **Nine corrected numbers.** Cold clocks, evaluation order, cross-run
+- **Ten corrected numbers.** Cold clocks, evaluation order, cross-run
   comparison, four portability assumptions, a too-short sample and three
   "counterintuitive" findings that turned out to be conventional. The
   corrections are recorded in place rather than overwritten. Treat any number
   here that is not attached to a described measurement method with suspicion.
-- **The autotuner is not reproducible.** It picks a different configuration
-  nearly every run, and on one shape that swings throughput by 28% (section 47).
-  Raw hardware noise across runs is only 5%. Any figure produced with the tune
-  cache disabled carries that selection variance, and a fix by runoff was tried
-  and made it worse.
+- **The autotuner's selection is imperfect, but the nondeterminism claim was
+  itself retracted** (section 48). The evidence for it was a 1.28x spread across
+  three runs, which sits inside cross-process measurement noise; the 5% noise
+  floor came from one shape with one configuration and does not generalise
+  (1.13-1.22x elsewhere). Scored against a shared measurement, mean regret is
+  4.3%, and the residual is one dimension -- tile height -- which looks
+  structural rather than noisy. A fix by runoff was tried and made it worse.
+  Not pursued further: tile selection is worth 1-2% of a step.
 - **Batched attention matmuls remain slow** at 0.6 to 1.0 TFLOPS. The shapes
   are small and awkward (head dim 48 or 64 against a 16-wide tile granularity).
 - **No split-K.** The tall-skinny weight-gradient matmuls (192 x 768 x 2048)

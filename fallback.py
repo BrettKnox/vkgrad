@@ -8,7 +8,10 @@ recent high-end silicon does not make commodity hardware more useful.
 
 This is the classic LDS-tiled, register-blocked scalar matmul, generated the
 same way as the cooperative-matrix one. It needs nothing beyond Vulkan 1.1 plus
-16-bit storage, and it can drop to fp32 operands where even that is missing.
+16-bit storage *in principle* -- the GLSL compiles cleanly at target_env
+vulkan1.1 -- but compile.py emits a 1.3 target today, so this has never been run
+against a 1.1 driver. It can drop to fp32 operands where even 16-bit storage is
+missing, though nothing currently selects that path.
 Slower than the matrix units, obviously. The point is that it runs at all.
 
 Layout and semantics match `kernels.matmul_glsl` exactly, including both

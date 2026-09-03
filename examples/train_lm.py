@@ -73,7 +73,8 @@ def main():
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--batch", type=int, default=8, help="microbatch size")
     ap.add_argument("--accum", type=int, default=1,
-                    help="microbatches per optimiser step; more and smaller is faster here")
+                    help="microbatches per optimiser step; helps only models near "
+                         "the memory ceiling, and is slower below it")
     ap.add_argument("--vocab", type=int, default=96)
     ap.add_argument("--lr", type=float, default=6e-4)
     ap.add_argument("--warmup-steps", type=int, default=200)
