@@ -524,3 +524,46 @@ Fix: measure candidates round-robin instead of one at a time.
 The dominant measurement error on this hardware is systematic and time
 correlated, not random, so statistical fixes target the wrong failure mode.
 Warm up, and interleave anything being compared.
+
+
+## 27. Ballast: proving traffic is causal
+
+A kernel that only streams N MiB is appended to the recorded training step, and
+the step timed for several N, variants interleaved in one warmed run.
+
+| ballast MiB | step ms | delta ms | implied GB/s |
+|---|---|---|---|
+| 0 | 18.10 | | |
+| 64 | 18.86 | 0.76 | 88.2 |
+| 128 | 19.43 | 1.33 | 100.9 |
+| 256 | 20.95 | 2.85 | 94.3 |
+| 384 | 22.97 | 4.87 | 82.6 |
+| 512 | 24.27 | 6.17 | 87.0 |
+
+Fitted marginal bandwidth **85.1 GB/s** vs 79.75 measured independently, ratio
+1.07. Added bytes cost time at the full DRAM rate, so the step has no spare
+bandwidth and traffic is causal rather than merely correlated.
+
+Exchange rate: **1 MiB saved is ~12.3 us saved.**
+
+## 28. Traffic as a step-time predictor
+
+Amplified bytes divided by the 85.1 GB/s marginal rate, with no measurement:
+
+| d_model | measured | predicted | error |
+|---|---|---|---|
+| 128 | 11.59 ms | 10.64 ms | -8.2% |
+| 192 | 18.17 ms | 18.37 ms | +1.1% |
+| 256 | 32.80 ms | 27.51 ms | -16.1% |
+| 384 | 54.92 ms | 49.06 ms | -10.7% |
+
+Within ~10-16%, systematically under-predicting, so roughly a tenth of the step
+is not bandwidth: launch overhead (278 dispatches x 0.61 us = 0.17 ms) plus
+kernels that are not purely streaming. Bandwidth-bound with a ~10% residue.
+
+Priced optimisations, not yet implemented:
+
+| change | bytes saved | predicted gain |
+|---|---|---|
+| drop duplicated f32 gradient buffers (`dz32`, `dqkv32`) | ~80 MiB | ~5% |
+| f16 accumulation for attention scores and dP | ~59 MiB | ~4% |

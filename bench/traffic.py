@@ -32,7 +32,8 @@ from kernels import warmup  # noqa: E402
 from transformer import GPT, TCtx  # noqa: E402
 from vk import Device  # noqa: E402
 
-PEAK_READ_GBS = 79.75  # measured, bench/roofline.py
+PEAK_READ_GBS = 79.75   # measured, bench/roofline.py
+MARGINAL_GBS = 85.1     # measured causally, bench/ballast.py
 
 
 def main():
@@ -80,6 +81,14 @@ def main():
     print(f"  amplified traffic   {ampl / 2**20:8.1f} MiB  -> "
           f"{ampl / step / 1e9:6.1f} GB/s  ({100 * ampl / step / 1e9 / PEAK_READ_GBS:.0f}% of peak)")
     print(f"  measured DRAM ceiling {PEAK_READ_GBS:.1f} GB/s\n")
+
+    # bench/ballast.py established causally that injected bytes cost time at
+    # 85.1 GB/s, so the amplified byte count can be turned straight into a
+    # predicted step time and checked against the clock.
+    pred = ampl / (MARGINAL_GBS * 1e9)
+    err = 100 * (pred - step) / step
+    print(f"  predicted step from traffic alone: {pred * 1e3:6.2f} ms "
+          f"({err:+.1f}% vs measured {step * 1e3:.2f} ms)\n")
 
     by = collections.defaultdict(lambda: [0, 0, 0])
     for name, c, a in g.traffic:

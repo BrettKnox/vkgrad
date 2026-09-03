@@ -325,6 +325,62 @@ removing the correlation, by warming up before measuring and by interleaving
 anything being compared. Every A/B comparison in this document is now measured
 interleaved within a single warmed run.
 
+### 2.9 Traffic is causal, not just correlated, and it prices optimisations
+
+Section 3 shows effective traffic sitting on the DRAM ceiling. That is
+consistent with being bandwidth-bound but does not establish it: a step can sit
+near the roofline and still be limited by something else, in which case removing
+bytes would buy nothing.
+
+`bench/ballast.py` is the controlled version. A kernel that does nothing but
+stream N MiB is appended to the recorded training step, and the step is timed
+for several N, with the variants interleaved inside one warmed run.
+
+| ballast | step | delta | implied GB/s |
+|---|---|---|---|
+| 0 MiB | 18.10 ms | | |
+| 64 | 18.86 ms | 0.76 | 88.2 |
+| 128 | 19.43 ms | 1.33 | 100.9 |
+| 256 | 20.95 ms | 2.85 | 94.3 |
+| 384 | 22.97 ms | 4.87 | 82.6 |
+| 512 | 24.27 ms | 6.17 | 87.0 |
+
+Least-squares slope over the whole range gives a **marginal bandwidth of
+85.1 GB/s**, against 79.75 GB/s measured independently by a pure streaming
+kernel. Ratio 1.07.
+
+**Added bytes cost time at the full DRAM rate.** The step has no spare
+bandwidth whatsoever, so traffic is causal: every byte removed is time removed.
+The exchange rate is concrete and useful, **1 MiB saved is about 12.3 us
+saved**, which prices any proposed optimisation before writing it.
+
+Turning that around, the analytic byte count becomes a step-time predictor with
+no measurement at all:
+
+| d_model | measured step | predicted from traffic | error |
+|---|---|---|---|
+| 128 | 11.59 ms | 10.64 ms | -8.2% |
+| 192 | 18.17 ms | 18.37 ms | +1.1% |
+| 256 | 32.80 ms | 27.51 ms | -16.1% |
+| 384 | 54.92 ms | 49.06 ms | -10.7% |
+
+Within roughly 10 to 16%, and **systematically under-predicting**, which is
+itself informative: about a tenth of the step is time that traffic does not
+explain. Some is launch overhead (278 dispatches at 0.61 us is 0.17 ms), the
+rest is kernels that are not purely streaming. So the honest summary is that
+this workload is bandwidth-bound with a ~10% residue, not perfectly
+bandwidth-bound.
+
+Two consequences worth stating plainly. First, no amount of extra arithmetic
+throughput would help this machine on this workload; the 15.33 TFLOPS of matrix
+hardware is not the constraint and never becomes it. Second, optimisations can
+now be ranked before being built. Eliminating the duplicated f32 gradient
+buffers (`dz32`, `dqkv32`, which exist only so the bias reduction can read
+f32) is worth about 80 MiB, or **5% of the step**; moving the attention score
+and gradient tensors to f16 accumulation is worth about 59 MiB, or **4%**.
+Neither is transformative, which is the useful part: the model says where the
+ceiling is, and it is close.
+
 ## 3. The headline comparison: an iGPU against the CPU on its own die
 
 Same silicon, same DRAM, same model. This is the question that matters for
@@ -442,7 +498,12 @@ transposes, residual branches, and the embedding scatter-add through
   are small and awkward (head dim 48 or 64 against a 16-wide tile granularity).
 - **No split-K.** The tall-skinny weight-gradient matmuls (192 x 768 x 2048)
   have too few workgroups to fill 12 CUs. Splitting the K loop across
-  workgroups is the obvious fix and is not implemented.
+  workgroups is the obvious fix and is not implemented. Section 2.9 caps what
+  it could win: the step is bandwidth-bound with only a ~10% non-bandwidth
+  residue, so scheduling fixes cannot buy much.
+- **Known traffic savings, unimplemented.** Duplicated f32 gradient buffers are
+  worth ~5% of a step and f16 attention accumulation another ~4%, priced using
+  the exchange rate in 2.9. Neither has been built.
 - **Tile-aligned shapes only.** Ragged dimensions are handled by padding the
   allocation, not by a masked epilogue in the kernel.
 - **f16 only for matmul inputs.** The hardware exposes f16 and int8 cooperative
