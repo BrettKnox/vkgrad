@@ -409,3 +409,33 @@ Matmul operand re-reads dominate, so tiling and blocking hold the remaining
 headroom. Note that for a 1.84M parameter model the step moves 896 MiB even at
 the compulsory bound, roughly 120x the parameter bytes: activations and
 intermediates, not weights, are the traffic.
+
+
+## 24. Can arithmetic replace the autotuner? No.
+
+`bench/predict.py`: for every candidate config on a shape, compute predicted
+DRAM traffic and measure actual throughput.
+
+| shape | role | traffic-only | >=1/CU | >=4/CU | >=8/CU | rho | best |
+|---|---|---|---|---|---|---|---|
+| 2048x768x192 | qkv forward | 100% | 100% | 100% | 95% | +0.85 | 2.74T |
+| 1024x1024x1024 | square | 94% | 94% | 92% | 94% | +0.66 | 3.22T |
+| 2048x192x768 | dX proj | 53% | 53% | 88% | 90% | +0.68 | 2.01T |
+| 2048x96x192 | head forward | 72% | 72% | 89% | 68% | +0.20 | 1.37T |
+| 192x768x2048 | dW qkv | 49% | 49% | 41% | 38% | -0.11 | 4.20T |
+| 192x192x2048 | dW proj | 23% | 23% | 18% | 96% | -0.29 | 2.22T |
+
+Percentages are the fraction of the measured best achieved by picking the
+minimum-traffic config among those with at least N workgroups.
+
+Forward matmuls: the model picks the optimum, rho strongly positive.
+Transposed weight-gradient matmuls: rho is *negative*, so traffic actively
+misleads. Minimising bytes there favours a tile spanning all of M=192, leaving
+12 workgroups for 12 CUs with no slack to hide latency.
+
+No workgroup-count floor fixes it. `>=8/CU` takes dW proj from 23% to 96% while
+dropping dW qkv to 38% and costing the forward shapes several percent.
+
+Empirical autotuning stays necessary, and it pays off exactly on the shapes the
+analytic model gets wrong, which are the two-thirds of matmul work that backward
+represents.

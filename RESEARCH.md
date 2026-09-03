@@ -172,6 +172,42 @@ configurations that cannot reach useful occupancy. It works and costs one
 compile per candidate, but currently prunes only 2 of ~84 configs: the
 threshold is set conservatively and is not yet earning much.
 
+### 2.6 The cost model predicts forward matmuls and is actively wrong on backward ones
+
+Section 3 shows the step runs at the DRAM limit. That invites an obvious
+simplification: if the machine is bandwidth-bound, the config moving the fewest
+bytes should win, and tile selection becomes arithmetic rather than a benchmark
+sweep. `bench/predict.py` tests it by computing predicted traffic and measured
+throughput for every candidate config on a shape.
+
+| shape | role | traffic model picks | Spearman rho |
+|---|---|---|---|
+| 2048 x 768 x 192 | qkv forward | **100%** of best | +0.85 |
+| 1024 x 1024 x 1024 | square | 94% | +0.66 |
+| 2048 x 192 x 768 | dX proj | 53% | +0.68 |
+| 2048 x 96 x 192 | head forward | 72% | +0.20 |
+| 192 x 768 x 2048 | **dW qkv** | 49% | **-0.11** |
+| 192 x 192 x 2048 | **dW proj** | 23% | **-0.29** |
+
+The split is by shape family, not by size. For forward matmuls the model picks
+the measured optimum or close to it, and predicted and measured orderings agree
+strongly. For the transposed weight-gradient matmuls the correlation is
+*negative*: traffic is not merely uninformative there, it points the wrong way.
+
+The mechanism is visible. Those shapes have M=192, so minimising traffic favours
+a tile as wide as the whole M dimension, which leaves 12 workgroups for 12 CUs
+and no slack to hide DRAM latency. The obvious correction, filtering to configs
+with a minimum number of workgroups per CU before minimising traffic, does not
+rescue it: a `>=8 per CU` floor takes `dW proj` from 23% to 96% but drops
+`dW qkv` to 38% and costs the forward shapes several percent. No single
+threshold works.
+
+**Conclusion: empirical autotuning cannot be replaced by this cost model**, and
+it earns its cost precisely where the model fails. Since backward runs two
+matmuls for every forward one, the shapes the analytic model gets wrong are the
+majority of the work. This is the concrete reason section 2.5's autotuner found
+a 4.2x gain on exactly these shapes.
+
 ## 3. The headline comparison: an iGPU against the CPU on its own die
 
 Same silicon, same DRAM, same model. This is the question that matters for
