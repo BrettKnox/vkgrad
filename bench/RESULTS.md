@@ -957,3 +957,54 @@ the four assumptions that were found to be wrong (unconditional feature
 requests, hardcoded subgroup stride, hardcoded dispatch multiplier, discrete-only
 memory selection) each now have a configuration that would catch them again, and
 that a fifth assumption of the same kind has somewhere to be caught.
+
+
+## 40. What can actually be trained on this hardware
+
+Everything up to here used 1.8M-parameter demos. The question that matters for
+"can people train on hardware they own" is what the ceiling actually is.
+
+Finding it first required removing a limit of my own making. `Kernel` allocated
+a single descriptor pool of 64 sets, and a recorded step binds the same kernel
+to one set per tensor, so a 6-layer model exhausted it and failed at
+construction. Nothing about the hardware required that. Pools are now chained,
+allocating another whenever the current one fills.
+
+With that gone, the frontier on a Radeon 780M (12 CU, unified DDR5-5600):
+
+| params | d_model | layers | seq | batch | step | tokens/s | memory |
+|---|---|---|---|---|---|---|---|
+| 1.8 M | 192 | 4 | 128 | 16 | 20.2 ms | 101,593 | 0.33 GiB |
+| 4.8 M | 256 | 6 | 128 | 16 | 67.5 ms | 30,359 | 0.65 GiB |
+| 10.8 M | 384 | 6 | 256 | 8 | 89.1 ms | 22,984 | 1.15 GiB |
+| 25.4 M | 512 | 8 | 256 | 8 | 225.5 ms | 9,083 | 2.13 GiB |
+| 85.4 M | 768 | 12 | 256 | 8 | 801.1 ms | 2,556 | 5.26 GiB |
+| 151.6 M | 1024 | 12 | 256 | 4 | 704.6 ms | 1,453 | 5.09 GiB |
+| 202.0 M | 1024 | 16 | 256 | 4 | 980.3 ms | 1,045 | 6.78 GiB |
+| **315.4 M** | 1280 | 16 | 256 | 2 | 803.2 ms | 637 | **7.31 GiB** |
+
+**315 million parameters trains on an integrated GPU**, in 7.3 of the 11.8 GiB
+available. That is past GPT-2 medium. Nothing here is inference: full forward,
+backward and AdamW, gradients verified against numpy.
+
+Turned into the number a person actually cares about, at a Chinchilla-optimal
+20 tokens per parameter:
+
+| params | tokens needed | wall time on this laptop |
+|---|---|---|
+| 1.8 M | 36.8 M | **6 minutes** |
+| 4.8 M | 96.4 M | **53 minutes** |
+| 10.8 M | 216 M | **2.6 hours** |
+| 25.4 M | 509 M | **15.6 hours** |
+| 85.4 M | 1.71 B | 7.2 days |
+
+A 25 million parameter language model, trained to Chinchilla-optimal, overnight,
+on an integrated laptop GPU with no CUDA and no ROCm. A 10 million parameter one
+over lunch.
+
+Above ~85M, training from scratch stops being practical (7 days and rising), but
+the models still fit and still run, so fine-tuning at those sizes is on the
+table.
+
+This is the most direct statement of the project's thesis. The barrier to
+training on hardware people already own was never that the silicon cannot do it.

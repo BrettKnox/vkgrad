@@ -616,12 +616,14 @@ class Kernel:
         # One descriptor set per distinct buffer tuple, not one per kernel: a
         # recorded command buffer holds its bindings, so two dispatches of the
         # same kernel on different buffers need different sets.
-        self.max_sets = MAX_SETS_PER_KERNEL
-        ps = DescPoolSize(DESC_STORAGE_BUFFER, n_buffers * self.max_sets)
-        pci = DescPoolCI(ST_DESCRIPTOR_POOL_CI, None, 0, self.max_sets, 1, C.pointer(ps))
-        self.pool = C.c_void_p()
-        _check(_lib.vkCreateDescriptorPool(dev.dev, C.byref(pci), None, C.byref(self.pool)),
-               "vkCreateDescriptorPool")
+        #
+        # Pools are chained rather than fixed. A deeper model binds the same
+        # kernel to more tensors (an 8-layer transformer needs well over 64 sets
+        # for the optimiser alone), and a fixed pool made model depth fail at
+        # construction time for no hardware reason.
+        self.pool_size = MAX_SETS_PER_KERNEL
+        self.pools = []
+        self._free_in_pool = 0
         self._sets = {}
         layouts = (C.c_void_p * 1)(self.dsl)
         self.dset = self._alloc_set()
@@ -702,12 +704,28 @@ class Kernel:
             out["subgroupSize"] = props[i].subgroupSize
         return out
 
+    def _new_pool(self):
+        ps = DescPoolSize(DESC_STORAGE_BUFFER, self.n_buffers * self.pool_size)
+        pci = DescPoolCI(ST_DESCRIPTOR_POOL_CI, None, 0, self.pool_size, 1,
+                         C.pointer(ps))
+        pool = C.c_void_p()
+        _check(_lib.vkCreateDescriptorPool(self.dev.dev, C.byref(pci), None,
+                                           C.byref(pool)), "vkCreateDescriptorPool")
+        self.pools.append(pool)
+        self._keep.append(ps)
+        self._free_in_pool = self.pool_size
+        return pool
+
     def _alloc_set(self):
+        if self._free_in_pool == 0:
+            self._new_pool()
         layouts = (C.c_void_p * 1)(self.dsl)
-        dsai = DescSetAllocInfo(ST_DESCRIPTOR_SET_ALLOCATE_INFO, None, self.pool, 1, layouts)
+        dsai = DescSetAllocInfo(ST_DESCRIPTOR_SET_ALLOCATE_INFO, None,
+                                self.pools[-1], 1, layouts)
         s = C.c_void_p()
         _check(_lib.vkAllocateDescriptorSets(self.dev.dev, C.byref(dsai), C.byref(s)),
                "vkAllocateDescriptorSets")
+        self._free_in_pool -= 1
         self._keep.append(layouts)
         return s
 
@@ -731,9 +749,6 @@ class Kernel:
         key = tuple(b.buf.value for b in buffers)
         s = self._sets.get(key)
         if s is None:
-            if len(self._sets) >= self.max_sets - 1:
-                raise VkError(f"{self.name}: more than {self.max_sets} distinct "
-                              "buffer bindings; raise MAX_SETS_PER_KERNEL")
             s = self._alloc_set()
             self._write_set(s, buffers)
             self._sets[key] = s
@@ -746,14 +761,16 @@ class Kernel:
 
     def destroy(self):
         d = self.dev.dev
+        for pool in self.pools:
+            _lib.vkDestroyDescriptorPool(d, pool, None)
+        self.pools = []
         for h, fn in ((self.pipeline, _lib.vkDestroyPipeline),
                       (self.layout, _lib.vkDestroyPipelineLayout),
-                      (self.pool, _lib.vkDestroyDescriptorPool),
                       (self.dsl, _lib.vkDestroyDescriptorSetLayout),
                       (self.module, _lib.vkDestroyShaderModule)):
             if h:
                 fn(d, h, None)
-        self.pipeline = self.layout = self.pool = self.dsl = self.module = None
+        self.pipeline = self.layout = self.dsl = self.module = None
 
 
 class Graph:

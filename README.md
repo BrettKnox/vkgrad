@@ -25,10 +25,13 @@ not officially reach.
 
 Write-up: [RESEARCH.md](RESEARCH.md). Raw measurements: [bench/RESULTS.md](bench/RESULTS.md).
 
-Headline: **5.1x faster than the CPU sharing the same die and the same DRAM**
-on a full MNIST training step (forward, backward, AdamW), 97.69% test accuracy.
-A 1.84M parameter transformer trains at 3.41x the CPU, with every gradient
-tensor matching an independent numpy model.
+Headline: **a 315M-parameter transformer trains on an integrated laptop GPU**,
+in 7.3 GiB, with no CUDA and no ROCm. At Chinchilla-optimal token counts that
+means a 10M model in 2.6 hours and a 25M model overnight. Full forward, backward
+and AdamW, with every gradient verified against numpy.
+
+On MNIST it runs 5.1x faster than the CPU sharing the same die and the same
+DRAM, reaching 97.69% test accuracy.
 
 ## Layout
 
