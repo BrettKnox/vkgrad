@@ -431,14 +431,26 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
         if not candidates:
             raise VkError(f"no matmul config fits {m}x{n}x{k}")
 
+        # Round-robin the measurements rather than finishing one config before
+        # starting the next. warmup() removes the big clock ramp, but residual
+        # drift over a sweep is still correlated with evaluation order, and
+        # measuring each config to completion in turn bakes that drift into the
+        # comparison. Interleaving spreads it evenly across candidates.
+        warm = {}
+        for mm, _, _ in candidates:
+            warm[id(mm)] = mm(a, b, c, m, n, k, **call)
+        best_t = {id(mm): float("inf") for mm, _, _ in candidates}
+        for _ in range(3):
+            for mm, _, _ in candidates:
+                # Keep any single submit well under the ~2s TDR window: a slow
+                # config at 4096^3 can take half a second per dispatch.
+                r = max(1, min(reps, int(0.2 / max(warm[id(mm)], 1e-6))))
+                t = mm(a, b, c, m, n, k, repeat=r, **call) / r
+                best_t[id(mm)] = min(best_t[id(mm)], t)
+
         results = []
         for mm, vgpr, occ in candidates:
-            warm = mm(a, b, c, m, n, k, **call)
-            # Keep any single submit well under the ~2s TDR window: a slow
-            # config at 4096^3 can take half a second per dispatch, and three
-            # of those back to back would risk a driver reset.
-            r = max(1, min(reps, int(0.2 / max(warm, 1e-6))))
-            t = min(mm(a, b, c, m, n, k, repeat=r, **call) / r for _ in range(3))
+            t = best_t[id(mm)]
             tf = mm.flops(m, n, k) * nb / t / 1e12
             results.append({"config": [mm.sg, mm.wm, mm.wn], "lds": mm.lds, "tflops": tf,
                             "ms": t * 1e3, "vgpr": vgpr, "occupancy": occ,

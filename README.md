@@ -73,9 +73,13 @@ Add `--quick` to either for a small, safe run on a busy machine.
 Set `VKGRAD_VALIDATE=1` to enable Vulkan validation layers. Do this while
 developing and not while benchmarking: they cost ~30% on submit.
 
-**Benchmarks must warm up.** GPU clocks ramp 2.7x over the first ~30 dispatches,
-so anything measured cold is measuring power management, not the kernel. Every
-bench script calls `kernels.warmup()`; if you write a new one, call it too.
+**Benchmarks must warm up, and comparisons must interleave.** GPU clocks ramp
+2.7x over the first ~30 dispatches, so anything measured cold is measuring power
+management rather than the kernel. Every bench script calls `kernels.warmup()`.
+Residual drift after warmup is still correlated with time, so the autotuner
+measures candidates round-robin and every A/B comparison alternates the two
+sides within one run. Both mistakes produced wrong published numbers here before
+they were caught.
 
 ## Three design choices worth knowing
 

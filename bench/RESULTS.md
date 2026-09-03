@@ -315,21 +315,24 @@ the weight-gradient matmuls that is wrong, because those are short and fat
 (`dW = X^T dY` is 192 x 768 x 2048) and a wide tile leaves only 18 workgroups
 for 12 CUs:
 
+Interleaved in one warmed run, median of 15 samples each, with the tuner using
+round-robin measurement (section 26):
+
 | shape | heuristic | autotuned | gain | tile chosen |
 |---|---|---|---|---|
-| 192 x 192 x 2048 (`dW` proj) | 0.37 TFLOPS | **2.16** | **5.8x** | 64 x 16 |
-| 192 x 768 x 2048 (`dW` qkv) | 2.20 TFLOPS | 3.57 | 1.6x | 64 x 32 |
-| 2048 x 768 x 192 (qkv fwd) | 2.80 TFLOPS | 2.63 | 0.94x | 256 x 128 |
-| 1024 x 1024 x 1024 (square) | 3.30 TFLOPS | 3.30 | 1.00x | 256 x 64 |
+| 192 x 192 x 2048 (`dW` proj) | 0.34 TFLOPS | **1.86** | **5.5x** | 16 x 16 |
+| 192 x 768 x 2048 (`dW` qkv) | 2.07 TFLOPS | 4.07 | 2.0x | 32 x 32 |
+| 2048 x 192 x 768 (`dX` proj) | 2.64 TFLOPS | 3.21 | 1.2x | 128 x 64 |
+| 2048 x 768 x 192 (qkv fwd) | 2.58 TFLOPS | 2.59 | 1.01x | 256 x 128 |
+| 1024 x 1024 x 1024 (square) | 3.16 TFLOPS | 3.18 | 1.00x | 256 x 64 |
 
-Up to 5.8x on a transposed backward shape, by picking a *smaller* tile that
-yields more workgroups. The heuristic is fine for forward matmuls, and on one
-of them the tuner picked slightly worse (0.94x) because a max over ~85 noisy
-candidates favours lucky samples.
+1.2x to 5.5x on the transposed and awkward shapes, exactly neutral on forward
+ones, never a loss. The gain comes from picking a *smaller* tile that yields
+more workgroups.
 
-These figures are post-warmup. The pre-warmup run of this table reported 4.2x
-on `dW qkv` and only 1.3x on `dW proj`; both were artifacts of clock ramp
-during the sweep. See section 25.
+Two earlier versions of this table were wrong: 4.2x on `dW qkv` (clock ramp,
+section 25) and a 0.94x loss on a forward shape (evaluation-order drift,
+section 26).
 
 ## 19. Honest remaining gap
 
@@ -480,7 +483,44 @@ Corrected as a result:
 
 Every qualitative conclusion survived. Several headline numbers did not.
 
-Residual 1.28x noise still matters: a max over ~85 tuner candidates is biased
-toward lucky samples, which is the likely cause of the tuner losing to the
-heuristic on one forward shape. Median-of-N would be more robust than the
-current best-of-N.
+Residual 1.28x noise remains. Section 26 tests whether it matters.
+
+
+## 26. Selection rule vs evaluation order
+
+Section 25 left a worry: with 1.28x residual noise, scoring candidates by their
+fastest observed time should favour lucky samples, and a median would be safer.
+
+`bench/selection.py` measures every candidate N times, takes each config's
+median over all N as ground truth, then bootstraps subsamples through each
+selection rule and scores the ground-truth quality of the pick.
+
+| shape | configs | noise | best-of-3 | median-of-3 | best-of-9 |
+|---|---|---|---|---|---|
+| 1024x1024x1024 square | 88 | 1.16x | 1.0% | 1.0% | 1.3% |
+| 2048x768x192 qkv fwd | 128 | 1.24x | 0.1% | 0.7% | 0.0% |
+| 192x768x2048 dW qkv | 46 | 1.76x | 1.2% | 1.4% | 1.5% |
+| 192x192x2048 dW proj | 31 | 2.21x | 2.6% | 3.5% | 1.1% |
+
+Regret is 0.1-3.5% for every rule and best-of-k beats median-of-k almost
+everywhere. The landscape is flat near its top. **The worry was unfounded** and
+switching to a median would have been slightly worse.
+
+That contradicted the observed 0.94x loss on `2048x768x192`, where regret is
+0.1%. The bootstrap assumed i.i.d. noise; the real tuner measures each config to
+completion before moving on, so its error is correlated with evaluation order.
+Warmup kills the big ramp, a slower drift survives, and sequential measurement
+bakes it into the comparison.
+
+Fix: measure candidates round-robin instead of one at a time.
+
+| shape | sequential | round-robin |
+|---|---|---|
+| 2048x768x192 qkv fwd | 0.95x | **1.01x** |
+| 1024x1024x1024 square | 1.04x | 1.00x |
+| 192x768x2048 dW qkv | 2.05x | 1.97x |
+| 192x192x2048 dW proj | 5.71x | 5.45x |
+
+The dominant measurement error on this hardware is systematic and time
+correlated, not random, so statistical fixes target the wrong failure mode.
+Warm up, and interleave anything being compared.

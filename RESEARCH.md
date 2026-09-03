@@ -153,22 +153,27 @@ A reasonable heuristic picks the widest tile that divides the shape. That is
 right for square forward matmuls and wrong for the transposed backward ones,
 which are short and fat:
 
+Measured by interleaving the tuned and heuristic configs in one warmed run and
+taking the median of 15 samples each, which is the only comparison method that
+survived section 2.8:
+
 | shape | heuristic | autotuned | gain | tile chosen |
 |---|---|---|---|---|
-| 192 x 192 x 2048 (`dW` proj) | 0.37 TFLOPS | **2.16** | **5.8x** | 64 x 16 |
-| 192 x 768 x 2048 (`dW` qkv) | 2.20 TFLOPS | 3.57 | 1.6x | 64 x 32 |
-| 2048 x 768 x 192 (qkv fwd) | 2.80 TFLOPS | 2.63 | 0.94x | 256 x 128 |
-| 1024 x 1024 x 1024 (square) | 3.30 TFLOPS | 3.30 | 1.00x | 256 x 64 |
+| 192 x 192 x 2048 (`dW` proj) | 0.34 TFLOPS | **1.86** | **5.5x** | 16 x 16 |
+| 192 x 768 x 2048 (`dW` qkv) | 2.07 TFLOPS | 4.07 | 2.0x | 32 x 32 |
+| 2048 x 192 x 768 (`dX` proj) | 2.64 TFLOPS | 3.21 | 1.2x | 128 x 64 |
+| 2048 x 768 x 192 (qkv fwd) | 2.58 TFLOPS | 2.59 | 1.01x | 256 x 128 |
+| 1024 x 1024 x 1024 (square) | 3.16 TFLOPS | 3.18 | 1.00x | 256 x 64 |
 
-The tuner wins on the transposed weight-gradient shapes, by up to 5.8x, and
-does nothing on forward shapes: on `2048 x 768 x 192` it picked slightly
-*worse* than the heuristic, which is the residual measurement noise of section
-2.7 leaking into a max over ~85 candidates. The gain comes from choosing a
-*smaller* tile, because a wide tile leaves only 18 workgroups for 12 CUs.
+The tuner wins by 1.2x to 5.5x on the transposed and awkward shapes and is
+exactly neutral on the forward ones, where the heuristic already picks
+correctly. It never loses. The gain comes from choosing a *smaller* tile,
+because a wide tile leaves only 18 workgroups for 12 CUs.
 
-(An earlier draft claimed 4.2x on `dW qkv`. That was measured before the
-warmup fix and was inflated by clock ramp; the honest figure is 1.6x there and
-5.8x on `dW proj`.)
+(Two earlier drafts of this table were wrong. The first claimed 4.2x on
+`dW qkv`, inflated by the clock ramp of section 2.7. The second showed the
+tuner *losing* 0.94x on a forward shape, which section 2.8 traced to
+evaluation-order drift inside the sweep and fixed.)
 
 A related trap: real models have dimensions that are not powers of two. A
 192-wide model with 4 heads has head dim 48, and with only power-of-two tile
@@ -266,9 +271,59 @@ and thermal budget with the CPU and sits at idle clocks most of the time, a
 benchmark that does not explicitly reach steady state is measuring the power
 management policy rather than the kernel.
 
-Residual noise of 1.28x still matters: taking a max over ~85 tuner candidates
-biases the winner upward, which is the most likely reason the tuner picked a
-slightly worse config than the heuristic on one forward shape.
+Residual noise of 1.28x remains. I assumed that mattered, because taking a max
+over ~85 candidates should favour lucky samples. Section 2.8 tested that
+assumption and it was wrong.
+
+### 2.8 The selection rule was not the problem; evaluation order was
+
+Section 2.7 left a plausible-sounding worry: with 1.28x residual noise, scoring
+each candidate by its *fastest* observed time should reward whichever config got
+a lucky sample. The obvious fix is a median instead of a max. That was worth
+testing before believing.
+
+`bench/selection.py` measures every candidate N times, defines ground truth as
+each config's median over all N, then bootstraps: repeatedly draw k samples per
+config, apply a selection rule, and score the *ground-truth* quality of whatever
+it picked. Regret is how far below the true optimum the pick lands.
+
+| shape | configs | per-config noise | best-of-3 | median-of-3 | best-of-9 |
+|---|---|---|---|---|---|
+| 1024x1024x1024 square | 88 | 1.16x | 1.0% | 1.0% | 1.3% |
+| 2048x768x192 qkv fwd | 128 | 1.24x | 0.1% | 0.7% | 0.0% |
+| 192x768x2048 dW qkv | 46 | 1.76x | 1.2% | 1.4% | 1.5% |
+| 192x192x2048 dW proj | 31 | 2.21x | 2.6% | 3.5% | 1.1% |
+
+**The worry was unfounded.** Regret is 0.1% to 3.5% for every rule, and
+best-of-k is equal or better than median-of-k everywhere. The throughput
+landscape is flat near its top, so selecting a slightly wrong config costs
+almost nothing. Switching to a median would have made things marginally worse.
+
+But that result created a contradiction. If selection regret on
+`2048 x 768 x 192` is 0.1%, why did the tuner pick a config 6% worse than the
+heuristic on exactly that shape? The answer is that the bootstrap modelled
+**i.i.d.** noise, while the real tuner measures each candidate to completion
+before starting the next, so its noise is **correlated with evaluation order**.
+Warmup removes the large ramp; a slower residual drift across a sweep survives,
+and measuring one config at a time bakes it into the comparison.
+
+The fix is not a better statistic, it is a better schedule: measure the
+candidates round-robin, so drift is spread evenly across all of them rather
+than accumulating along the list. After that change the tuner stops losing:
+
+| shape | before (one config at a time) | after (round-robin) |
+|---|---|---|
+| 2048 x 768 x 192 qkv fwd | 0.95x vs heuristic | **1.01x** |
+| 1024 x 1024 x 1024 square | 1.04x | 1.00x |
+| 192 x 768 x 2048 dW qkv | 2.05x | 1.97x |
+| 192 x 192 x 2048 dW proj | 5.71x | 5.45x |
+
+The general lesson, and the reason both 2.7 and 2.8 exist: on this hardware the
+dominant measurement error is **systematic and correlated with time**, not
+random. Statistical fixes address the wrong failure mode. What works is
+removing the correlation, by warming up before measuring and by interleaving
+anything being compared. Every A/B comparison in this document is now measured
+interleaved within a single warmed run.
 
 ## 3. The headline comparison: an iGPU against the CPU on its own die
 
@@ -395,10 +450,9 @@ transposes, residual branches, and the embedding scatter-add through
   f32 master weights. No dynamic loss scaling has been needed at these model
   sizes, but it would be at larger ones.
 - **The occupancy pruner is undertuned**, rejecting only 2 of 84 candidates.
-- **Autotuner selection is noisy.** Even warmed up, repeat measurements vary by
-  ~1.28x, and picking the max over ~85 candidates biases toward lucky
-  measurements. A median-of-N criterion would be more robust than the current
-  best-of-N.
+- **Autotuning is per shape and not free.** A full sweep is ~85 compiles plus
+  measurement per shape, cached to disk afterwards. Section 2.8 shows the
+  selection rule itself is not the problem, but the sweep still costs seconds.
 - **CPU baselines use numpy/OpenBLAS**, which is a strong but not maximal CPU
   implementation. The transformer CPU baseline counts matmuls only.
 
