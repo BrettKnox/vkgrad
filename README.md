@@ -18,6 +18,7 @@ officially reach.
 | 1. runtime + zero-copy allocator | done, verified |
 | 2. WMMA matmul + autotuner | done, verified. Forward and both backward transposes |
 | 3. autograd + training | done. MNIST 97.69%, and a 1.84M param transformer trains |
+| 4. multi-device without NCCL | mechanism verified: DDP over shared host memory, 0 bytes transferred |
 
 Write-up: [RESEARCH.md](RESEARCH.md). Raw measurements: [bench/RESULTS.md](bench/RESULTS.md).
 
@@ -35,12 +36,15 @@ kernels.py         matmul generators (direct + LDS), fused elementwise kernels, 
 autograd.py        tape, Linear/MLP, fused AdamW, recorded TrainStep
 tkernels.py        LayerNorm, causal attention softmax, head permutes, embeddings
 transformer.py     decoder-only transformer: attention, blocks, GPT
+dataparallel.py    DDP over shared host memory: replicated weights, atomic gradient arena
 test_runtime.py    runtime self-checks
 test_kernels.py    kernel correctness vs numpy
 test_autograd.py   gradient checks vs numpy and finite differences
 test_transformer.py  full transformer fwd+bwd vs an independent numpy model
+test_shared.py     host memory imported by several independent VkDevices
 examples/mnist.py  trains an MLP, races it against the same model on the CPU
 examples/charlm.py trains a char-level transformer on local text
+examples/ddp_mnist.py  data-parallel MNIST across N devices, no NCCL
 bench/roofline.py  bandwidth, dispatch overhead, fp32 and WMMA ceilings
 bench/matmul_sweep.py  matmul throughput vs the CPU baseline
 bench/nightly.ps1  unattended full sweep, records machine load alongside results

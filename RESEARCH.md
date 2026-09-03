@@ -523,7 +523,94 @@ get more is to move fewer bytes, not to find more FLOPs. Concretely, of the
 1,491 MiB an amplified step moves at d=192, matmul operand re-reads are 61.5%,
 so tiling and blocking are where the remaining headroom lives.
 
-## 4. What this cost, and what it needs
+## 4. Vendor independence needs more than portable kernels
+
+Everything above is about making one iGPU fast. That work is now bounded: the
+machine is bandwidth-bound with a ~10% residue, the remaining priced
+optimisations are worth a few percent each, and int8 turns out to buy no
+arithmetic at all on RDNA3 (section 4.1). No amount of further tuning here
+changes who can train models.
+
+What does change it is the other half of the lock-in, which is rarely discussed
+next to CUDA: **the collective**. Multi-GPU training runs on NCCL. NCCL is
+NVIDIA-only. Portable kernels do not help if the gradient exchange still
+requires one vendor's hardware, driver and interconnect, and there is no
+cross-vendor equivalent.
+
+### 4.1 int8 buys nothing on this hardware
+
+int8 matrix units are the most widely available accelerator primitive in
+consumer silicon, so int8 training would reach hardware with no CUDA and no
+path to it. Measured as a pure register loop with no memory traffic:
+
+| operands | rate | vs f16 |
+|---|---|---|
+| f16 x f16 -> f32 | 15.30 TOPS | 1.00x |
+| f16 x f16 -> f16 | 15.33 TOPS | 1.00x |
+| i8 x i8 -> i32 | 15.13 TOPS | 0.99x |
+| u8 x u8 -> i32 | 15.13 TOPS | 0.99x |
+
+Every operand type issues at the same rate. This contradicts the NVIDIA
+intuition, where int8 tensor cores run at roughly 2x fp16. On RDNA3's WMMA int8
+offers only halved operand bytes, capping it at ~27% of a step before
+quantisation overhead and backward-pass range problems. Recorded so nobody else
+spends a week on it.
+
+### 4.2 A collective that needs no vendor
+
+`VK_EXT_external_memory_host` lets one ordinary host allocation be imported by
+several independent `VkDevice`s at once. Plain system RAM becomes a shared arena
+between GPUs. Nothing about that requires the devices to share a vendor, a
+driver, or an interconnect.
+
+That is enough to build DDP without NCCL:
+
+- weights are **replicated**, one copy per device, and never exchanged
+- each device computes gradients for its own shard of the batch
+- each device **atomically adds** its gradients into the shared arena
+- every device applies the identical optimiser step from that arena
+
+Replicas start identical and apply identical updates, so they stay identical and
+only gradients ever cross. The arena is a flat concatenation of every
+parameter's gradient, so the whole collective is two kernels: one zeroing pass
+and one atomic add per device.
+
+On unified memory the arena is the same DRAM the GPU already reads, so the
+all-reduce degenerates into several workers adding into the same bytes. There is
+nothing to transfer. On a discrete card it is the host side of that card's PCIe
+path.
+
+`python -m examples.ddp_mnist --devices N` trains MNIST this way:
+
+| devices | final loss | weight drift between replicas | bytes transferred |
+|---|---|---|---|
+| 1 | 0.3260 | | |
+| 2 | 0.3237 | **0.000e+00** | **0** |
+| 4 | 0.3247 | **0.000e+00** | **0** |
+
+Replicas are **bit-identical** after training, which is the strong form of the
+claim: nothing but gradients crossed, and the exchange is exact rather than
+approximately right.
+
+### 4.3 What this does and does not show
+
+It shows the mechanism is real and the arithmetic is exact, across an arbitrary
+number of independent devices, with a collective that has no vendor-specific
+component anywhere in it.
+
+It does not show two vendors. These runs use several `VkDevice`s created from
+the one physical GPU this machine has, so they share hardware and there is no
+wall-clock gain: 0.4 s, 0.8 s, 1.5 s for 1, 2 and 4 devices, since the same
+silicon does more total work plus per-device overhead. Proving the cross-vendor
+case needs two cards from different vendors in one machine, which I do not have.
+
+The reason it is worth reporting anyway: every part of this path is core Vulkan
+or a widely implemented extension, and `VK_KHR_cooperative_matrix` is exposed by
+NVIDIA, AMD and Intel. A gaming PC with an NVIDIA card and an AMD iGPU has two
+usable training devices today and no software that will use both. This is the
+piece that was missing, and it is 120 lines.
+
+## 5. What this cost, and what it needs
 
 The whole stack is **2,799 lines of Python** for the runtime, kernels, autograd
 and transformer, plus 1,466 more for tests, benchmarks and examples, plus the
@@ -547,7 +634,7 @@ The transformer check covers causal attention, LayerNorm, both attention
 transposes, residual branches, and the embedding scatter-add through
 `VK_EXT_shader_atomic_float`.
 
-## 5. Honest limitations
+## 6. Honest limitations
 
 - **One GPU tested.** Everything here is measured on gfx1103. The code paths
   are generic Vulkan, and the runtime degrades gracefully when
@@ -577,7 +664,7 @@ transposes, residual branches, and the embedding scatter-add through
 - **CPU baselines use numpy/OpenBLAS**, which is a strong but not maximal CPU
   implementation. The transformer CPU baseline counts matmuls only.
 
-## 6. Reproducing
+## 7. Reproducing
 
 ```bash
 python test_runtime.py && python test_kernels.py && python test_autograd.py && python test_transformer.py
