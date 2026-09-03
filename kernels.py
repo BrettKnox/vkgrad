@@ -416,6 +416,37 @@ def lds_only_best(best):
     return best.get("lds", False)
 
 
+# A single submit must stay well under the ~2 s TDR window; half a second per
+# dispatch is reachable at 4096^3.
+_TDR_CAP_S = 0.2
+# Target GPU time per measurement. Every candidate is timed over the same
+# amount of work, not the same number of dispatches.
+_MEASURE_S = 0.02
+
+
+# Restores the two pre-fix behaviours so the fix can be measured against them
+# in alternating processes, rather than against a number remembered from an
+# earlier session.
+_LEGACY = os.environ.get("VKGRAD_LEGACY_TUNE") == "1"
+
+
+def _repeat_for(t_one):
+    """Dispatches per submit, so every candidate is timed over equal GPU time.
+
+    A fixed repeat count does not mean a fixed measurement effort. At repeat=3
+    a config taking 0.1 ms was timed over 0.3 ms of work while one taking 70 ms
+    was timed over a single dispatch, so their estimates had wildly different
+    variance. Scoring by `min` then rewards variance: the minimum of a noisier
+    estimator sits further below the truth, so the slowest, noisiest candidates
+    were flattered in proportion to how slow they were. Equalising the *time*
+    per measurement removes that bias at its source instead of averaging it
+    away afterwards.
+    """
+    if _LEGACY:
+        return max(1, min(3, int(_TDR_CAP_S / max(t_one, 1e-6))))
+    return max(1, int(min(_MEASURE_S, _TDR_CAP_S) / max(t_one, 1e-6)))
+
+
 def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
                     verbose=False, use_cache=True, batched=False, nbatch=1):
     """Pick the fastest tile configuration for one shape.
@@ -483,11 +514,9 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
         for mm, _, _ in candidates:
             warm[id(mm)] = mm(a, b, c, m, n, k, **call)
         best_t = {id(mm): float("inf") for mm, _, _ in candidates}
-        for _ in range(3):
+        for _ in range(reps):
             for mm, _, _ in candidates:
-                # Keep any single submit well under the ~2s TDR window: a slow
-                # config at 4096^3 can take half a second per dispatch.
-                r = max(1, min(reps, int(0.2 / max(warm[id(mm)], 1e-6))))
+                r = _repeat_for(warm[id(mm)])
                 t = mm(a, b, c, m, n, k, repeat=r, **call) / r
                 best_t[id(mm)] = min(best_t[id(mm)], t)
 
@@ -512,8 +541,8 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
         # candidate count for a knob that is nearly orthogonal to tile shape.
         if not lds_only_best(best):
             sgb, wmb, wnb = best["config"]
-            gbest = (best["tflops"], 0)
-            for gm in (2, 4, 8):
+            variants = []
+            for gm in ((2, 4, 8) if _LEGACY else (0, 2, 4, 8)):
                 try:
                     gmm = Matmul(dev, sgb, wmb, wnb, trans_a, trans_b, lds=False,
                                  batched=batched, group_m=gm)
@@ -522,18 +551,37 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
                 if not gmm.fits(m, n, k):
                     gmm.destroy()
                     continue
-                gmm(a, b, c, m, n, k, **call)
-                tg = min(gmm(a, b, c, m, n, k, repeat=3, **call) / 3 for _ in range(3))
-                tf = gmm.flops(m, n, k) * nb / tg / 1e12
+                variants.append((gm, gmm))
+
+            # group_m=0 is re-measured here rather than carried over from stage
+            # one. Comparing a fresh stage-two number against a stale stage-one
+            # number is a cross-session comparison, which is the single mistake
+            # this project has had to correct most often, and here it was the
+            # thing deciding whether the swizzle won. Round-robin for the same
+            # reason stage one does.
+            if variants:
+                gwarm = {gm: g(a, b, c, m, n, k, **call) for gm, g in variants}
+                gt = {gm: float("inf") for gm, _ in variants}
+                for _ in range(reps):
+                    for gm, g in variants:
+                        r = _repeat_for(gwarm[gm])
+                        gt[gm] = min(gt[gm], g(a, b, c, m, n, k, repeat=r, **call) / r)
+                scored = [(g.flops(m, n, k) * nb / gt[gm] / 1e12, gm)
+                          for gm, g in variants]
+                if _LEGACY:
+                    # The stale stage-one number, carried across sessions.
+                    scored.append((best["tflops"], 0))
+                scored.sort(reverse=True)
                 if verbose:
-                    print(f"    group_m={gm:2d} on winning tile   {tf:7.3f} TFLOPS")
-                if tf > gbest[0]:
-                    gbest = (tf, gm)
-                gmm.destroy()
-            if gbest[1]:
-                best = dict(best, tflops=gbest[0], group_m=gbest[1], lds=False)
-                if verbose:
-                    print(f"    -> group_m={gbest[1]} wins, {gbest[0]:.3f} TFLOPS")
+                    for tf, gm in scored:
+                        print(f"    group_m={gm:2d} on winning tile   "
+                              f"{tf:7.3f} TFLOPS")
+                tf, gm = scored[0]
+                best = dict(best, tflops=tf, group_m=gm, lds=False)
+                if verbose and gm:
+                    print(f"    -> group_m={gm} wins, {tf:.3f} TFLOPS")
+            for _, g in variants:
+                g.destroy()
         best["pruned"] = len(pruned)
         best["evaluated"] = len(results)
         if verbose and pruned:

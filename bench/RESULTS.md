@@ -1358,3 +1358,71 @@ carrying up to 30% selection variance on top of the 5% hardware variance.
 
 `bench/ab.py` also provides `interleaved(variants)` so the correct comparison
 method is the convenient one.
+
+## 48. The tuner fix: half the regret, none of the reproducibility
+
+Section 47 claimed the autotuner was nondeterministic, on the evidence that three
+processes picked three configs spanning 1.28x. That claim was not established.
+Scoring a pick by re-measuring it in its own process carries 1.13-1.22x of
+cross-process noise on these shapes, which swallows the effect. The 5% noise
+floor measured in section 47 came from one shape with one configuration and does
+not generalise. Tenth correction, same cause as the other nine.
+
+Two real defects were found by reading the tuner, and both are fixed:
+
+1. **Stage two compared across measurement sessions.** `gbest = (best["tflops"], 0)`
+   seeded the swizzle comparison with a stage-one number taken minutes earlier
+   under a different protocol; the `group_m=0` baseline was never re-measured.
+   Now all four variants are measured round-robin in stage two.
+2. **Equal repeat count is not equal measurement effort.** `min(reps, 0.2/warm)`
+   timed a 0.1 ms config over 0.3 ms of work and a 70 ms config over one
+   dispatch, so per-submit fence overhead contaminated each measurement in
+   inverse proportion to kernel speed, systematically penalising the fastest
+   tiles. `_repeat_for()` now sizes each measurement to ~20 ms of GPU time.
+
+Note this inverts the mechanism first proposed. The prediction was that `min`
+over a noisy estimator would flatter slow configs; the dominant effect runs the
+other way and is simpler. The fix is right, the reasoning behind it was wrong.
+
+### Measuring it properly
+
+`bench/determinism.py` runs both arms in alternating processes, then measures
+every configuration anyone picked ONCE, interleaved, in a single process. Picks
+are scored against that shared table, so spread reflects selection alone.
+
+| shape | arm | distinct picks / 3 | mean regret | worst |
+|---|---|---|---|---|
+| 2048x768x192 qkv forward | fixed | 3 | **8.5%** | 19.4% |
+| 2048x768x192 qkv forward | legacy | 1 | **19.4%** | 19.4% |
+| 1024^3 square | fixed | 1 | 2.1% | 2.1% |
+| 1024^3 square | legacy | 2 | 1.4% | 2.1% |
+| 192x768x2048 dW qkv | fixed | 3 | 2.2% | 4.1% |
+| 192x768x2048 dW qkv | legacy | 3 | 2.0% | 4.1% |
+
+Aggregate mean regret 7.6% -> 4.3%. But the shape of the win is not what was
+predicted: legacy picked the *same* config every run and that config was always
+19.4% below optimum. The fix picks differently each run and sometimes finds the
+best. It is better on average and less consistent. Reliably wrong became
+intermittently right.
+
+### The residual is a design flaw, not noise
+
+All three fixed picks on the qkv shape were `wm2 wn8 lds0 g2`, differing only in
+`sg`: same tile width, same swizzle, three tile heights spanning 3.01 to 3.74
+TFLOPS. Width and swizzle are chosen consistently; height is not resolved at all.
+
+The likely cause is structural. Stage one ranks tiles with `group_m=0`, then
+stage two swizzles only the winner, on the stated assumption that workgroup
+ordering is "nearly orthogonal to tile shape". If the swizzle's benefit depends
+on tile height, that assumption is false and the two-stage split cannot find the
+optimum however well each stage is measured. Untested; the cheap test is to
+sweep `group_m` over the top-K tiles rather than the top one.
+
+### Stopping here
+
+That test is not being run. Section 8 and section 20 already establish that
+matmul speedups do not become step speedups: 1.22-2.19x in isolation became
+under 20% end to end, flat across five model sizes. An 8.5% tile-selection
+regret is worth perhaps 1-2% of a training step. Several iterations have now
+gone into this autotuner, which is precisely the failure mode this file
+documents elsewhere. The bytes moved are the lever; the tuner is not.
