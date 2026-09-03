@@ -248,9 +248,22 @@ class Matmul:
             push = struct.pack("III", m, n, k)
             groups = (m // self.bm, n // self.bn, 1)
         if graph is not None:
-            graph.record(self.kernel, [a, b, c], groups, push)
+            graph.record(self.kernel, [a, b, c], groups, push,
+                         bytes_hint=self.traffic_bytes(m, n, k, nbatch))
             return 0.0
         return self.dev.run(self.kernel, [a, b, c], groups, push, repeat=repeat)
+
+    def traffic_bytes(self, m, n, k, nbatch=1):
+        """Upper bound on DRAM traffic: every tile re-reads its A row-block and
+        B column-block from scratch. Real traffic is lower because L2 catches
+        some of the re-reads, so this brackets the truth from above while
+        `compulsory` (each tensor once) brackets it from below.
+        """
+        nb = nbatch if self.batched else 1
+        reads_a = m * k * 2 * (n // self.bn)
+        reads_b = k * n * 2 * (m // self.bm)
+        writes_c = m * n * 4
+        return nb * (reads_a + reads_b + writes_c)
 
     def flops(self, m, n, k):
         return 2 * m * n * k

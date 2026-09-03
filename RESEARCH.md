@@ -208,12 +208,40 @@ optimiser, so it flatters the CPU.)
 Matmul speedup peaks at 8.2x. Transformer training sits at 2.3 to 2.9x and
 **does not improve with model size** across a 9x parameter range.
 
-That is not a bug, it is the architecture. The GPU and the CPU are on the same
-die and share one memory controller. A large matmul has enough arithmetic
-intensity to sit above the ridge point, so the GPU's compute advantage shows.
-Transformer training at these sizes is memory-bound end to end, so both
-processors converge toward the same bandwidth ceiling and the ratio settles at
-something closer to a bandwidth ratio than a compute ratio.
+That is not a bug, it is the architecture, and it is measured rather than
+inferred. `bench/traffic.py` totals the bytes every dispatch in a step moves and
+divides by the step time. Two bounds are reported, because neither is exactly
+right alone: *compulsory* traffic touches every buffer once (a lower bound,
+assuming perfect reuse), *amplified* traffic assumes each matmul tile re-reads
+its operands from DRAM (an upper bound, assuming the cache catches nothing).
+
+| d_model | params | step | compulsory | amplified |
+|---|---|---|---|---|
+| 128 | 0.83 M | 11.60 ms | 51.4 GB/s | **78.0 GB/s** |
+| 192 | 1.84 M | 18.31 ms | 51.3 GB/s | **85.4 GB/s** |
+| 256 | 3.24 M | 33.21 ms | 37.0 GB/s | **70.5 GB/s** |
+| 384 | 7.22 M | 48.66 ms | 39.1 GB/s | **85.8 GB/s** |
+
+The measured DRAM ceiling on this machine is **79.75 GB/s**. The amplified
+figure sits on it, within +/-10%, flat across a 9x parameter range. **The step
+runs at the memory bandwidth limit**, and effective traffic is close to the
+no-reuse bound.
+
+So: the GPU and the CPU are on the same die and share one memory controller. A
+large matmul has enough arithmetic intensity to sit above the ridge point, so
+the GPU's compute advantage shows. Transformer training at these sizes is
+saturating DRAM, so both processors converge on the same ceiling and the ratio
+settles at a bandwidth ratio rather than a compute ratio.
+
+One refinement this forces on section 2.4. Effective traffic tracking the
+*amplified* bound means the L2 is catching very little of the cross-workgroup
+re-reads, which sounds like it contradicts "the L2 already serves the reuse LDS
+was going to provide". It does not: LDS staging deduplicates reads happening
+*simultaneously* within one workgroup, which the cache does handle, while the
+amplification counted here is different row-blocks re-reading the same B columns
+at different times, which a 2 MB L2 cannot hold. Caches catch simultaneous
+reuse, not distant reuse. That is also why tile *width* was the lever: wider
+tiles reduce the distant re-reads that nothing else is catching.
 
 **On an APU, the iGPU's advantage over its own CPU is capped by the shared
 memory bus, not by arithmetic.** The 13.75 TFLOPS of matrix hardware is mostly
@@ -223,8 +251,10 @@ resource and the interconnect is the thing you optimise around.
 
 The practical consequences: below roughly 256x256 matmuls the GPU is not worth
 the trouble; between there and the point where memory saturates, expect 2 to 5x
-rather than the 10 to 100x that discrete-GPU experience suggests; and the way
-to get more is to move fewer bytes, not to find more FLOPs.
+rather than the 10 to 100x that discrete-GPU experience suggests; and the way to
+get more is to move fewer bytes, not to find more FLOPs. Concretely, of the
+1,491 MiB an amplified step moves at d=192, matmul operand re-reads are 61.5%,
+so tiling and blocking are where the remaining headroom lives.
 
 ## 4. What this cost, and what it needs
 

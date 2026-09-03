@@ -710,8 +710,11 @@ class Graph:
         self._barrier = MemoryBarrier(ST_MEMORY_BARRIER, None, ACCESS_SHADER_WRITE,
                                       ACCESS_SHADER_READ | ACCESS_SHADER_WRITE)
         self._keep = []
+        # (name, compulsory bytes, bytes including tile re-reads). Lets a step
+        # be compared against measured DRAM bandwidth instead of guessed at.
+        self.traffic = []
 
-    def record(self, kernel, buffers, groups, push=b""):
+    def record(self, kernel, buffers, groups, push=b"", bytes_hint=None):
         if self._finished:
             raise VkError(f"{self.name}: already finished")
         gx, gy, gz = (tuple(groups) + (1, 1))[:3] if isinstance(groups, (tuple, list)) \
@@ -734,6 +737,9 @@ class Graph:
                                     len(push), pbuf)
             self._keep.append(pbuf)
         _lib.vkCmdDispatch(self.cmd, gx, gy, gz)
+        compulsory = sum(b.size for b in buffers)
+        self.traffic.append((kernel.name, compulsory,
+                             compulsory if bytes_hint is None else bytes_hint))
         self.n_dispatch += 1
 
     def finish(self):

@@ -376,3 +376,36 @@ batched attention matmuls remain the weakest part of the stack.
 Transformer step, d=192, autotuned: forward 5.79 ms over 59 dispatches,
 backward plus optimiser 11.53 ms over the remaining 165. The 2:1 ratio is
 expected, since backward runs two matmuls (dX and dW) per forward matmul.
+
+
+## 23. Confirming the bandwidth claim
+
+`bench/traffic.py` totals the bytes every dispatch moves and divides by step
+time, bracketing effective traffic between compulsory (every buffer once) and
+amplified (every matmul tile re-reads its operands).
+
+| d_model | step | compulsory | amplified | ceiling |
+|---|---|---|---|---|
+| 128 | 11.60 ms | 51.4 GB/s | 78.0 GB/s | 79.75 |
+| 192 | 18.31 ms | 51.3 GB/s | 85.4 GB/s | 79.75 |
+| 256 | 33.21 ms | 37.0 GB/s | 70.5 GB/s | 79.75 |
+| 384 | 48.66 ms | 39.1 GB/s | 85.8 GB/s | 79.75 |
+
+The amplified figure sits on the measured DRAM ceiling, flat across a 9x
+parameter range. The step is bandwidth-bound, and effective traffic is close to
+the no-reuse bound.
+
+Traffic breakdown at d=192 (1,491 MiB amplified per step):
+
+| kernel | calls | MiB | share |
+|---|---|---|---|
+| matmul | 75 | 917.4 | 61.5% |
+| bias_gelu_bwd | 4 | 84.0 | 5.6% |
+| col_sum_chunk | 35 | 81.8 | 5.5% |
+| bias_gelu | 4 | 60.0 | 4.0% |
+| layernorm_bwd | 9 | 54.1 | 3.6% |
+
+Matmul operand re-reads dominate, so tiling and blocking hold the remaining
+headroom. Note that for a 1.84M parameter model the step moves 896 MiB even at
+the compulsory bound, roughly 120x the parameter bytes: activations and
+intermediates, not weights, are the traffic.
