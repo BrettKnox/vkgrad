@@ -30,14 +30,21 @@ def make_reduce_kernels(dev):
     # Atomically accumulate a device's local gradient into the shared arena.
     # This IS the all-reduce: on unified memory there is nothing to transfer,
     # the workers are adding into the same bytes.
-    K["push"] = Elementwise(
-        dev, "grad_push",
-        [("g", "f32", "readonly"), ("arena", "f32", "")],
-        """
-        atomicAdd(arena[p.off + i], g[i]);
-        """,
-        push=[("off", "uint")],
-        extensions=["GL_EXT_shader_atomic_float"])
+    #
+    # Built only where the device has float atomics. Raspberry Pi's v3dv and
+    # several mobile drivers do not, and building this unconditionally took
+    # single-device gradient accumulation down with it -- GradAccum has one
+    # writer, never dispatches `push`, and was failing at construction over a
+    # kernel it does not use.
+    if getattr(dev, "has_atomic_float", True):
+        K["push"] = Elementwise(
+            dev, "grad_push",
+            [("g", "f32", "readonly"), ("arena", "f32", "")],
+            """
+            atomicAdd(arena[p.off + i], g[i]);
+            """,
+            push=[("off", "uint")],
+            extensions=["GL_EXT_shader_atomic_float"])
 
     # Non-atomic accumulate, for a single writer. Gradient accumulation on one
     # device has no concurrent writers, and at GPT-2 scale a step issues ~162
@@ -110,6 +117,11 @@ class Replica:
         assert off <= arena.n, f"arena too small: need {off}, have {arena.n}"
 
     def push_gradients(self, graph=None):
+        if "push" not in self.K:
+            raise VkError(
+                "multi-device gradient exchange needs VK_EXT_shader_atomic_float, "
+                "which this device lacks. Single-device accumulation (GradAccum) "
+                "still works; it uses the non-atomic path.")
         for p, off in zip(self.params, self.offsets):
             self.K["push"]([p.g32, self.arena_buf], p.n, off, graph=graph)
 

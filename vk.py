@@ -8,9 +8,40 @@ ponytail: no graphics, no swapchain, no images. Compute-only by construction.
 
 import ctypes as C
 import os
+import sys
 import time
 
-_lib = C.CDLL("vulkan-1.dll")
+
+def _load_vulkan():
+    """Find the Vulkan loader on whatever platform this is.
+
+    Hardcoding "vulkan-1.dll" made the framework Windows-only, which is a
+    strange thing for a project whose entire argument is portability. It also
+    silently blocked every second-vendor target worth testing: Raspberry Pi,
+    Android, and any Linux machine. Ordered candidates that degrade rather than
+    fail, the same shape as the memory-kind ladders below.
+    """
+    if sys.platform == "win32":
+        names = ["vulkan-1.dll"]
+    elif sys.platform == "darwin":
+        # No native Vulkan on macOS; MoltenVK translates to Metal.
+        names = ["libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib"]
+    else:
+        # Linux and Android. Android ships only the unversioned name.
+        names = ["libvulkan.so.1", "libvulkan.so"]
+    tried = []
+    for n in names:
+        try:
+            return C.CDLL(n)
+        except OSError as e:
+            tried.append(f"{n}: {e}")
+    raise ImportError(
+        "no Vulkan loader found. Tried:\n  " + "\n  ".join(tried) +
+        "\nOn Linux install the vendor driver's ICD (mesa-vulkan-drivers, "
+        "amdvlk, or nvidia-driver); on Android use the system loader.")
+
+
+_lib = _load_vulkan()
 
 # ---------------------------------------------------------------- constants
 
