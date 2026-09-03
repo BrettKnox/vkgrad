@@ -1301,3 +1301,60 @@ What survives all of it, because it was measured interleaved from the start: the
 machine is bandwidth-bound (section 27, ballast), matmul speedups do not become
 step speedups (1.22-2.19x isolated versus under 20% end to end), and the
 hardware floor for training is far below what the peak FLOPS ratio implies.
+
+
+## 47. The noise floor, measured, and where the corrections really came from
+
+Nine corrections here were blamed on "cross-run variation of 20-30%". That
+explanation was itself asserted rather than measured, so `bench/ab.py --noise`
+measures it: the same tuned matmul, seven separate processes.
+
+| | spread |
+|---|---|
+| across-run spread of medians | **1.05x (5%)** |
+| across-run spread of bests | 1.06x (6%) |
+| across-run stdev / mean | 2.0% |
+
+**Raw cross-run noise is 5%, not 20-30%.** So the stated reason for the
+corrections was wrong.
+
+The actual cause is the autotuner. Running the same tuning sweep in three
+separate processes:
+
+| shape | configs chosen | resulting TFLOPS | spread |
+|---|---|---|---|
+| 2048x768x192 | three different | 2.48 / 3.10 / 3.17 | **1.28x** |
+| 192x768x2048 (dW) | three different | 4.18 / 4.20 / 4.40 | 1.05x |
+| 1024x1024x1024 | three different | 3.39 / 3.27 / 3.30 | 1.04x |
+
+**The tuner picks a different configuration nearly every run**, and on one shape
+that cost 28% because it missed the swizzled variant entirely. Its sweep measures
+~85 candidates once each, and 5% noise across candidates that differ by less than
+that is enough to choose wrongly.
+
+So any measurement that includes a fresh autotune is not reproducible across
+runs to better than about 30%, while the underlying hardware is reproducible to
+5%. That is a property of the framework, not the silicon, and it is the real
+mechanism behind the corrections.
+
+### A fix that did not work
+
+The obvious remedy is a runoff: re-measure the top three candidates interleaved
+and pick between those. Implemented and tested across three runs, it made
+selection *worse*, spread 1.28x to 1.80x. Reverted rather than kept.
+
+Why it failed is not established. The plausible explanation is that many
+candidates sit within noise of each other while a few are genuinely much better,
+so a runoff among the top three of a noisy ranking often does not contain the
+real winner at all. Fixing that properly means making the first pass less noisy,
+not re-ranking its output.
+
+### What to do instead, for now
+
+Use the autotune disk cache, which is on by default: a shape is tuned once and
+the choice reused, so runs are reproducible even though the tuning itself is
+not. Every benchmark in this document that disabled the cache should be read as
+carrying up to 30% selection variance on top of the 5% hardware variance.
+
+`bench/ab.py` also provides `interleaved(variants)` so the correct comparison
+method is the convenient one.

@@ -504,6 +504,7 @@ def autotune_matmul(dev, m, n, k, trans_a=False, trans_b=False, reps=3,
                       f"{tf:7.3f} TFLOPS  vgpr={vgpr or '?'} waves={occ or '?'}")
 
         results.sort(key=lambda r: -r["tflops"])
+
         best = results[0]
 
         # Second stage: for the winning tile only, sweep the workgroup
