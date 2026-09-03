@@ -610,7 +610,64 @@ NVIDIA, AMD and Intel. A gaming PC with an NVIDIA card and an AMD iGPU has two
 usable training devices today and no software that will use both. This is the
 piece that was missing, and it is 120 lines.
 
-## 5. What this cost, and what it needs
+## 5. You do not need matrix units to train
+
+Everything up to here ran on `VK_KHR_cooperative_matrix`. That extension needs
+AMD RDNA3+, NVIDIA Turing+, or Intel Arc, which excludes Polaris, Vega, Pascal,
+Maxwell, every Intel integrated GPU before Arc, Adreno, Mali and the Raspberry
+Pi. Most GPUs that exist. A stack that only runs on recent high-end silicon is
+not a stack that makes commodity hardware useful, so the fallback matters more
+than any of the tuning above.
+
+`fallback.py` is the classic LDS-tiled, register-blocked scalar matmul,
+generated the same way as the cooperative-matrix one, needing nothing beyond
+Vulkan 1.1 and 16-bit storage (and able to drop to fp32 operands where even
+that is missing). It matches the numpy reference **exactly**, 0.00e+00, since
+f16 operands with fp32 accumulation reproduce the reference arithmetic
+bit-for-bit, and it implements both backward transposes and the batched form
+attention needs.
+
+The expectation, from the peak numbers, was that dropping the matrix units
+would cost about 2.9x: 15.33 TFLOPS of WMMA against 5.30 TFLOPS of fp32 vector
+throughput. Measured, interleaved, median of nine:
+
+| shape | cooperative matrix | scalar | ratio |
+|---|---|---|---|
+| 512x512x512 | 1.12 T | 0.66 T | 1.69x |
+| 1024x1024x1024 | 2.77 T | 2.27 T | **1.22x** |
+| 2048x2048x2048 | 4.21 T | 1.92 T | 2.19x |
+| 2048x768x192 | 2.92 T | 1.62 T | 1.80x |
+
+And on actual training, with `VKGRAD_NO_COOPMAT=1` forcing the scalar path:
+
+| workload | matrix units | scalar | cost |
+|---|---|---|---|
+| MNIST MLP step | 5.39x CPU | 5.07x CPU | **~6%** |
+| transformer step | 20.58 ms | 21.81 ms | **~6%** |
+| MNIST accuracy | 97.69% | 97.39% | none |
+| gradient checks | pass | pass | none |
+
+**Matrix units are worth about 6% on a real training step here.** Not 2.9x.
+
+The reason is the whole thesis of this document. A bandwidth-bound machine
+leaves the matrix units idle most of the time, so removing them removes
+capacity that was not being used. Section 2.9 measured that directly: the step
+runs at the DRAM limit with a ~10% non-bandwidth residue, and matrix throughput
+lives entirely inside that residue.
+
+This is the most consequential result here, and it is worth stating plainly
+because it cuts against how the hardware is marketed. Tensor cores are sold as
+the thing that makes AI possible. For *training* on *memory-bound consumer
+hardware*, they are close to a rounding error. What matters is memory
+bandwidth, and a 2016 GPU with no matrix units at all is far more competitive
+for this than its spec sheet suggests.
+
+The practical consequence: vkgrad's hardware target is not "RDNA3, Turing, Arc".
+It is any GPU with a Vulkan 1.1 driver. The runtime detects
+`VK_KHR_cooperative_matrix` and uses it when present, falls back automatically
+when absent, and trains either way.
+
+## 6. What this cost, and what it needs
 
 The whole stack is **2,799 lines of Python** for the runtime, kernels, autograd
 and transformer, plus 1,466 more for tests, benchmarks and examples, plus the
@@ -634,11 +691,11 @@ The transformer check covers causal attention, LayerNorm, both attention
 transposes, residual branches, and the embedding scatter-add through
 `VK_EXT_shader_atomic_float`.
 
-## 6. Honest limitations
+## 7. Honest limitations
 
 - **One GPU tested.** Everything here is measured on gfx1103. The code paths
-  are generic Vulkan, and the runtime degrades gracefully when
-  `cooperative_matrix` is absent, but no other device has been run.
+  are generic Vulkan and the scalar fallback is exercised by the full test
+  suite (`VKGRAD_NO_COOPMAT=1`), but no other physical device has been run.
 - **Batched attention matmuls remain slow** at 0.6 to 1.0 TFLOPS. The shapes
   are small and awkward (head dim 48 or 64 against a 16-wide tile granularity).
 - **No split-K.** The tall-skinny weight-gradient matmuls (192 x 768 x 2048)
@@ -664,7 +721,7 @@ transposes, residual branches, and the embedding scatter-add through
 - **CPU baselines use numpy/OpenBLAS**, which is a strong but not maximal CPU
   implementation. The transformer CPU baseline counts matmuls only.
 
-## 7. Reproducing
+## 8. Reproducing
 
 ```bash
 python test_runtime.py && python test_kernels.py && python test_autograd.py && python test_transformer.py

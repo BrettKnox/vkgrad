@@ -6,9 +6,11 @@ The point is not another inference runtime. Vulkan cooperative matrix (matrix
 cores) is already used for inference by llama.cpp and ncnn. Nothing runs a
 **backward pass** on it. This does.
 
-Target: integrated and consumer GPUs people already own. Developed against an
-AMD Radeon 780M (RDNA3 iGPU, 12 CU) under Windows, where ROCm does not
-officially reach.
+Target: any GPU with a Vulkan 1.1 driver. Cooperative matrix is used when the
+device has it and a scalar fallback runs when it does not, which costs about 6%
+on a real training step rather than the 2.9x the peak numbers imply. Developed
+against an AMD Radeon 780M (RDNA3 iGPU, 12 CU) under Windows, where ROCm does
+not officially reach.
 
 ## State
 
@@ -19,6 +21,7 @@ officially reach.
 | 2. WMMA matmul + autotuner | done, verified. Forward and both backward transposes |
 | 3. autograd + training | done. MNIST 97.69%, and a 1.84M param transformer trains |
 | 4. multi-device without NCCL | mechanism verified: DDP over shared host memory, 0 bytes transferred |
+| 5. runs without matrix units | scalar fallback, exact vs numpy, ~6% slower on a real step |
 
 Write-up: [RESEARCH.md](RESEARCH.md). Raw measurements: [bench/RESULTS.md](bench/RESULTS.md).
 
@@ -36,6 +39,7 @@ kernels.py         matmul generators (direct + LDS), fused elementwise kernels, 
 autograd.py        tape, Linear/MLP, fused AdamW, recorded TrainStep
 tkernels.py        LayerNorm, causal attention softmax, head permutes, embeddings
 transformer.py     decoder-only transformer: attention, blocks, GPT
+fallback.py        scalar tiled matmul for GPUs with no matrix units
 dataparallel.py    DDP over shared host memory: replicated weights, atomic gradient arena
 test_runtime.py    runtime self-checks
 test_kernels.py    kernel correctness vs numpy

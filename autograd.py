@@ -10,8 +10,11 @@ and accumulates in f32, so activations and the weight mirrors are f16 while
 master weights, gradients and optimiser state stay f32.
 """
 
+import os
+
 import numpy as np
 
+from fallback import pick_scalar
 from kernels import CONFIGS, TILE, Matmul, make_kernels
 from vk import VkError
 
@@ -45,12 +48,26 @@ class Ctx:
         self.dev = dev
         self.K = make_kernels(dev)
         self.tune = tune
+        # Devices without VK_KHR_cooperative_matrix (Polaris, Vega, Pascal,
+        # Maxwell, pre-Arc Intel, Adreno, Mali, Raspberry Pi) still train, just
+        # on the scalar path. VKGRAD_NO_COOPMAT=1 forces it for testing.
+        self.scalar_only = (not dev.has_coop_matrix
+                            or os.environ.get("VKGRAD_NO_COOPMAT") == "1")
         self._mm = {}
         self._owned = []
 
     def matmul(self, m, n, k, trans_a=False, trans_b=False, batched=False, nbatch=1):
         key = (m, n, k, trans_a, trans_b, batched, nbatch)
         if key not in self._mm:
+            if self.scalar_only:
+                # No matrix units on this device (or forced off for testing).
+                # Costs 1.2-2.2x here, far less than the 2.9x peak ratio, since
+                # a bandwidth-bound machine leaves the matrix units idle anyway.
+                mm = pick_scalar(self.dev, m, n, k, trans_a, trans_b,
+                                 batched=batched,
+                                 min_groups=1 if batched else 12)
+                self._mm[key] = mm
+                return mm
             if self.tune:
                 from kernels import autotune_matmul
                 mm, _ = autotune_matmul(self.dev, m, n, k, trans_a, trans_b,

@@ -784,3 +784,40 @@ devices is *separate memory systems*. Two workers behind one memory controller
 share the bottleneck and cannot win. A discrete GPU brings its own VRAM and its
 own controller, which is exactly the configuration the shared-arena collective
 of section 32 targets.
+
+
+## 35. The scalar fallback, and what matrix units are actually worth
+
+`VK_KHR_cooperative_matrix` needs RDNA3+, Turing+ or Arc. `fallback.py` adds an
+LDS-tiled register-blocked scalar matmul needing only Vulkan 1.1 and 16-bit
+storage, matching numpy **exactly** (0.00e+00: f16 operands with fp32
+accumulation reproduce the reference bit-for-bit), with both backward
+transposes and the batched form.
+
+Peak ratio predicts a 2.9x penalty (15.33 vs 5.30 TFLOPS). Measured,
+interleaved, median of 9:
+
+| shape | coopmat | scalar | ratio |
+|---|---|---|---|
+| 512x512x512 | 1.12 T | 0.66 T | 1.69x |
+| 1024x1024x1024 | 2.77 T | 2.27 T | 1.22x |
+| 2048x2048x2048 | 4.21 T | 1.92 T | 2.19x |
+| 2048x768x192 | 2.92 T | 1.62 T | 1.80x |
+
+On real training, `VKGRAD_NO_COOPMAT=1`:
+
+| workload | matrix units | scalar | cost |
+|---|---|---|---|
+| MNIST MLP step | 5.39x CPU | 5.07x CPU | ~6% |
+| transformer step | 20.58 ms | 21.81 ms | ~6% |
+| MNIST accuracy | 97.69% | 97.39% | none |
+| autograd + transformer gradient checks | pass | pass | none |
+
+**Matrix units are worth ~6% on a training step, not 2.9x.** The machine is
+bandwidth-bound (section 27), so the matrix units are idle most of the time and
+removing them removes unused capacity. Their entire contribution fits inside
+the ~10% non-bandwidth residue of section 28.
+
+Hardware target is therefore any Vulkan 1.1 GPU, not just recent high-end
+parts. The runtime detects the extension, uses it when present, and falls back
+automatically when absent.
