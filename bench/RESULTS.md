@@ -821,3 +821,43 @@ the ~10% non-bandwidth residue of section 28.
 Hardware target is therefore any Vulkan 1.1 GPU, not just recent high-end
 parts. The runtime detects the extension, uses it when present, and falls back
 automatically when absent.
+
+
+## 36. The portability claim was false; feature negotiation fixes it
+
+Section 35 claimed the hardware target was "any GPU with a Vulkan 1.1 driver".
+Auditing the runtime showed that was not true: `_create_device` requested 15
+features unconditionally, and Vulkan fails device creation outright if any
+requested feature is unsupported. On a Vulkan 1.1 GPU (GTX 1060, RX 580, Intel
+HD 620) `vkCreateDevice` would have failed and nothing would have run.
+
+Worse, most of them were speculative. `bufferDeviceAddress`, `vulkanMemoryModel`,
+`vulkanMemoryModelDeviceScope`, `scalarBlockLayout`, `maintenance4`,
+`shaderInt8` and the two 8-bit storage features are not used by any kernel in
+the project. They were enabled because they looked useful.
+
+The runtime now queries `vkGetPhysicalDeviceFeatures2` first and requests only
+the intersection of wanted and supported, down from 15 features to 7:
+
+| feature | gates | required |
+|---|---|---|
+| `storageBuffer16BitAccess` | f16 operands, halving operand traffic | yes |
+| `uniformAndStorageBuffer16BitAccess` | same | yes |
+| `shaderFloat16` | f16 arithmetic in shaders | yes |
+| `cooperativeMatrix` | matrix units, worth ~6% | no |
+| `subgroupSizeControl` | wave32 for cooperative matrix | no |
+| `computeFullSubgroups` | same | no |
+| `shaderBufferFloat32AtomicAdd` | transformer embeddings, fast bias reductions | no |
+
+`cooperativeMatrix` is also now verified through the *feature* query rather than
+extension presence alone, so a driver that advertises the extension but reports
+the feature false falls back correctly instead of failing.
+
+`check_device.py` reports all of this for whatever GPU it is run on, including
+what the missing pieces would cost, so the failure mode on unsupported hardware
+is a clear message rather than a Vulkan error code.
+
+This is the second time a portability claim in this document did not survive
+being checked. The general lesson is the same one as the measurement sections:
+claims about behaviour on hardware you have not run on need a mechanism that
+makes them true, not an assumption that they are.

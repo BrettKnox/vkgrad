@@ -929,45 +929,71 @@ class Device:
 
         self.has_coop_matrix = "VK_KHR_cooperative_matrix" in self.extensions
 
-        f13 = Vulkan13Features(ST_PHYS_VULKAN_13_FEATURES, None)
-        f13.subgroupSizeControl = 1
-        f13.computeFullSubgroups = 1
-        f13.maintenance4 = 1
+        # Ask the device what it supports BEFORE requesting anything. Enabling
+        # an unsupported feature makes vkCreateDevice fail outright, so a
+        # speculative request is the difference between "degrades gracefully"
+        # and "does not run at all" on older hardware.
+        s13 = Vulkan13Features(ST_PHYS_VULKAN_13_FEATURES, None)
+        s12 = Vulkan12Features(ST_PHYS_VULKAN_12_FEATURES,
+                               C.cast(C.pointer(s13), C.c_void_p))
+        s11 = Vulkan11Features(ST_PHYS_VULKAN_11_FEATURES,
+                               C.cast(C.pointer(s12), C.c_void_p))
+        shead = C.cast(C.pointer(s11), C.c_void_p)
+        scm = None
+        if self.has_coop_matrix:
+            scm = CoopMatrixFeatures(ST_PHYS_COOP_MATRIX_FEATURES_KHR, shead, 0, 0)
+            shead = C.cast(C.pointer(scm), C.c_void_p)
+        saf = None
+        if "VK_EXT_shader_atomic_float" in self.extensions:
+            saf = AtomicFloatFeatures(1000260000, shead)
+            shead = C.cast(C.pointer(saf), C.c_void_p)
+        sf2 = Features2(ST_PHYS_FEATURES_2, shead)
+        _lib.vkGetPhysicalDeviceFeatures2(self.phys, C.byref(sf2))
 
+        # Only these are actually used by a kernel. Anything else was
+        # speculative and is not requested.
+        want11 = ["storageBuffer16BitAccess", "uniformAndStorageBuffer16BitAccess"]
+        want12 = ["shaderFloat16"]
+        want13 = ["subgroupSizeControl", "computeFullSubgroups"]
+
+        f13 = Vulkan13Features(ST_PHYS_VULKAN_13_FEATURES, None)
         f12 = Vulkan12Features(ST_PHYS_VULKAN_12_FEATURES,
                                C.cast(C.pointer(f13), C.c_void_p))
-        f12.shaderFloat16 = 1
-        f12.shaderInt8 = 1
-        f12.storageBuffer8BitAccess = 1
-        f12.uniformAndStorageBuffer8BitAccess = 1
-        f12.bufferDeviceAddress = 1
-        f12.vulkanMemoryModel = 1
-        f12.vulkanMemoryModelDeviceScope = 1
-        f12.scalarBlockLayout = 1
-
         f11 = Vulkan11Features(ST_PHYS_VULKAN_11_FEATURES,
                                C.cast(C.pointer(f12), C.c_void_p))
-        f11.storageBuffer16BitAccess = 1
-        f11.uniformAndStorageBuffer16BitAccess = 1
+
+        self.features = {}
+        for src_, dst_, names in ((s11, f11, want11), (s12, f12, want12),
+                                  (s13, f13, want13)):
+            for nm in names:
+                ok = bool(getattr(src_, nm))
+                self.features[nm] = ok
+                if ok:
+                    setattr(dst_, nm, 1)
 
         head = C.cast(C.pointer(f11), C.c_void_p)
         cm = None
-        if self.has_coop_matrix:
+        if self.has_coop_matrix and scm and scm.cooperativeMatrix:
             cm = CoopMatrixFeatures(ST_PHYS_COOP_MATRIX_FEATURES_KHR, head, 1, 0)
             head = C.cast(C.pointer(cm), C.c_void_p)
+        else:
+            self.has_coop_matrix = False
+        self.features["cooperativeMatrix"] = self.has_coop_matrix
 
         af = None
-        self.has_atomic_float = "VK_EXT_shader_atomic_float" in self.extensions
+        self.has_atomic_float = bool(saf and saf.shaderBufferFloat32AtomicAdd)
         if self.has_atomic_float:
             af = AtomicFloatFeatures(1000260000, head)
             af.shaderBufferFloat32Atomics = 1
             af.shaderBufferFloat32AtomicAdd = 1
             head = C.cast(C.pointer(af), C.c_void_p)
+        self.features["shaderBufferFloat32AtomicAdd"] = self.has_atomic_float
 
         pep = None
         self.has_pipeline_stats = "VK_KHR_pipeline_executable_properties" in self.extensions
         if self.has_pipeline_stats:
-            pep = PipelineExecPropsFeatures(ST_PHYS_PIPELINE_EXEC_PROPS_FEATURES_KHR, head, 1)
+            pep = PipelineExecPropsFeatures(ST_PHYS_PIPELINE_EXEC_PROPS_FEATURES_KHR,
+                                            head, 1)
             head = C.cast(C.pointer(pep), C.c_void_p)
 
         f2 = Features2(ST_PHYS_FEATURES_2, head)
@@ -979,7 +1005,8 @@ class Device:
         self.dev = C.c_void_p()
         _check(_lib.vkCreateDevice(self.phys, C.byref(dci), None, C.byref(self.dev)),
                "vkCreateDevice")
-        self._keep_device = (f2, f11, f12, f13, cm, pep, af, prio, qci, keep_ext, ext_ptr)
+        self._keep_device = (f2, f11, f12, f13, cm, pep, af, prio, qci,
+                             keep_ext, ext_ptr, s11, s12, s13, scm, saf, sf2)
 
         self.queue = C.c_void_p()
         _lib.vkGetDeviceQueue(self.dev, self.qfam, 0, C.byref(self.queue))

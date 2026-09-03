@@ -46,6 +46,7 @@ test_kernels.py    kernel correctness vs numpy
 test_autograd.py   gradient checks vs numpy and finite differences
 test_transformer.py  full transformer fwd+bwd vs an independent numpy model
 test_shared.py     host memory imported by several independent VkDevices
+check_device.py    will vkgrad run on this GPU, and what will it get
 examples/mnist.py  trains an MLP, races it against the same model on the CPU
 examples/charlm.py trains a char-level transformer on local text
 examples/ddp_mnist.py  data-parallel MNIST across N devices, no NCCL
@@ -57,6 +58,12 @@ bench/nightly.ps1  unattended full sweep, records machine load alongside results
 Dependencies: numpy, and the Vulkan SDK for `glslc`. That's it.
 
 ## Running
+
+Start here on any new machine:
+
+```bash
+python check_device.py
+```
 
 ```bash
 python test_runtime.py
