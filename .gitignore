@@ -16,3 +16,7 @@ __pycache__/
 # Training run outputs.
 runs/
 data/pycorpus.npy
+
+# Harness scaffolding, not part of the project.
+.readme-task.md
+.gemini-prompt.txt
