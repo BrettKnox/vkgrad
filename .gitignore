@@ -7,6 +7,11 @@ data/
 bench/*.json
 scratch/
 
+# ...except the one the README cites. A published number needs an artefact in the repo,
+# and this file holds only the command, the run count and the numbers: no hostname, no
+# username, no process list, which is what the exclusions above and below exist to keep out.
+!bench/mnist-repro.json
+
 # Benchmark run output: contains hostname, username and a process list.
 bench/runs/
 

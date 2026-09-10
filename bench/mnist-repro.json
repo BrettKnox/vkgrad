@@ -1,0 +1,67 @@
+{
+ "command": "python -m examples.mnist --epochs 4",
+ "runs": 5,
+ "recorded_utc": "2026-09-10T02:31:07Z",
+ "accuracy_pct": {
+  "min": 97.51,
+  "median": 97.61,
+  "max": 97.71
+ },
+ "speedup_x": {
+  "min": 4.9,
+  "median": 5.34,
+  "max": 5.65
+ },
+ "gpu_step_ms": {
+  "min": 0.481,
+  "median": 0.493,
+  "max": 0.499
+ },
+ "cpu_step_ms": {
+  "min": 2.415,
+  "median": 2.577,
+  "max": 2.74
+ },
+ "each": [
+  {
+   "final_accuracy_pct": 97.6,
+   "final_loss": 0.0663,
+   "wall_s": 1.6,
+   "gpu_step_ms": 0.485,
+   "cpu_step_ms": 2.74,
+   "speedup_x": 5.65
+  },
+  {
+   "final_accuracy_pct": 97.51,
+   "final_loss": 0.0676,
+   "wall_s": 1.6,
+   "gpu_step_ms": 0.481,
+   "cpu_step_ms": 2.577,
+   "speedup_x": 5.36
+  },
+  {
+   "final_accuracy_pct": 97.61,
+   "final_loss": 0.0674,
+   "wall_s": 1.6,
+   "gpu_step_ms": 0.497,
+   "cpu_step_ms": 2.657,
+   "speedup_x": 5.34
+  },
+  {
+   "final_accuracy_pct": 97.66,
+   "final_loss": 0.0662,
+   "wall_s": 1.6,
+   "gpu_step_ms": 0.493,
+   "cpu_step_ms": 2.415,
+   "speedup_x": 4.9
+  },
+  {
+   "final_accuracy_pct": 97.71,
+   "final_loss": 0.0657,
+   "wall_s": 1.6,
+   "gpu_step_ms": 0.499,
+   "cpu_step_ms": 2.48,
+   "speedup_x": 4.97
+  }
+ ]
+}

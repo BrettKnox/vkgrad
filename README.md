@@ -21,8 +21,8 @@ reach. Raw numbers in [bench/RESULTS.md](bench/RESULTS.md), the write-up is [RES
 
 | | |
 |---|---|
-| MNIST, full training run | **97.69%** test accuracy in 1.6 s of wall time |
-| against the CPU sharing the same die and DRAM | **5.09x** faster |
+| MNIST, full training run | **97.6%** test accuracy (5 runs: 97.51 to 97.78) in 1.6 s of wall time |
+| against the CPU sharing the same die and DRAM | **5.3x** faster (5 runs: 4.90 to 5.65) |
 | largest model trained | **315.4M** parameters in 7.31 of 11.8 GiB |
 | sustained throughput, 12-minute run | **21,382 tokens/s** |
 

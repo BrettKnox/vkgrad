@@ -235,6 +235,15 @@ memory rather than clever engineering:
 2.398 ms and 53,387 samples/s for the same model in numpy on all 8 CPU cores:
 **5.09x**.
 
+**Re-measured 2026-09-09, and one run was never enough.** `python bench/mnist_repro.py
+--runs 5` re-ran this exact command five times on the same machine and wrote
+`bench/mnist-repro.json`. Accuracy 97.51 to 97.78,
+median **97.61%**. Speedup 4.90 to 5.65, median **5.34x**. So the single-run 5.09x above
+is not optimistic, it sits *below* the median, and the honest headline is a range rather
+than either endpoint. A sixth run earlier the same day returned 4.75x, which is why the
+range matters: quoting any one of these as the number is a coin flip dressed up as a
+measurement.
+
 Clears the >=97% correctness gate. Everything above it, from the cooperative
 matrix loads to the fused AdamW, is exercised by this run.
 
