@@ -237,7 +237,7 @@ memory rather than clever engineering:
 
 **Re-measured 2026-09-09, and one run was never enough.** `python bench/mnist_repro.py
 --runs 5` re-ran this exact command five times on the same machine and wrote
-`bench/mnist-repro.json`. Accuracy 97.51 to 97.78,
+`bench/mnist-repro.json`. Accuracy 97.51 to 97.71,
 median **97.61%**. Speedup 4.90 to 5.65, median **5.34x**. So the single-run 5.09x above
 is not optimistic, it sits *below* the median, and the honest headline is a range rather
 than either endpoint. A sixth run earlier the same day returned 4.75x, which is why the
@@ -1129,9 +1129,9 @@ section 46). In fine-tuning terms:
 
 | tokens | wall time |
 |---|---|
-| 1 M | **15 minutes** |
-| 10 M | **2.5 hours** |
-| 50 M | 12.4 hours |
+| 1 M | **17 minutes** |
+| 10 M | **2.9 hours** |
+| 50 M | 14.5 hours |
 
 Domain adaptation on a laptop iGPU with no CUDA is a matter of hours, not a
 matter of renting a GPU.

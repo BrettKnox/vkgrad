@@ -5,10 +5,10 @@
 optimiser through Vulkan compute on an integrated GPU under Windows, where ROCm
 does not officially reach.
 
-It trains MNIST to 97.69%, trains a 10.8M-parameter transformer to a real loss
+It trains MNIST to 97.6% (5-run median, 97.51 to 97.71), trains a 10.8M-parameter transformer to a real loss
 curve in twelve minutes, fits and trains **315M parameters** in 7.3 GiB, and
-runs GPT-2 small's architecture at 1,117 tokens/s. It needs no matrix units
-(they are worth about 6%), and its multi-device gradient exchange needs no
+runs GPT-2 small's architecture at about 956 tokens/s. It needs no matrix units
+(they are worth -5% to +18%, median about 8%), and its multi-device gradient exchange needs no
 NCCL.
 
 **Why it might matter.** CUDA is the only mature training stack. Everything
@@ -463,7 +463,9 @@ publishes an answer to.
 | 4096 | 3.76 | 24.5% | 0.76 | 5.0x |
 
 **MNIST MLP**, full training step including backward and AdamW: 0.471 ms vs
-2.398 ms, **5.09x**, reaching 97.69% test accuracy in 1.6 seconds of wall time.
+2.398 ms, **5.3x** (5 runs: 4.90 to 5.65), reaching 97.6% test accuracy in 1.6
+seconds of wall time. The 5.09x and 97.69% first published here were a single run,
+which is a sample and not a measurement; `bench/mnist-repro.json` is the artefact.
 
 **Transformer**, full training step, across a 9x range of model sizes:
 
@@ -830,8 +832,14 @@ Most people would fine-tune rather than train from scratch. GPT-2 small's
 architecture (768 d_model, 12 layers, 12 heads, vocab 50257, learned positions,
 pre-LayerNorm, GELU) is what this already builds:
 
-**1,117 tokens/s in 3.92 GiB.** That is 1M tokens in 15 minutes, 10M in 2.5
-hours, 50M in 12.4 hours. Domain adaptation on a laptop is a matter of hours.
+**956 tokens/s in 3.92 GiB.** That is 1M tokens in 17 minutes, 10M in 2.9
+hours, 50M in 14.5 hours. Domain adaptation on a laptop is a matter of hours.
+
+(This headline read 1,117 tok/s until 2026-09-10, with 15 minutes / 2.5 hours /
+12.4 hours under it. That figure was cross-run: `bench/RESULTS.md` section 47 records
+"the originally published 1,117 / 844 / 668 was again cross-run: batch 2 measures 956
+here". RESULTS.md was hedged at the time and this file was not, so the derived table
+stayed 17% optimistic in the document the README links as the write-up.)
 
 (Measured with random weights. Loading real GPT-2 checkpoints would also need
 the weight file, a BPE tokenizer, and embedding/head weight tying, none of which
@@ -857,9 +865,9 @@ rise together.
 
 ## 8. What this cost, and what it needs
 
-The whole stack is **3,542 lines of Python** for the runtime, kernels,
+The whole stack is **about 3,700 lines of Python** for the runtime, kernels,
 autograd, transformer, scalar fallback and multi-device collective, plus the
-rest of the 6,612 total for tests, benchmarks and examples, plus the GLSL it
+rest of the roughly 7,700 total for tests, benchmarks and examples, plus the GLSL it
 generates. Dependencies:
 numpy, and `glslc` from the Vulkan SDK. No C compiler, no Rust, no vendor
 bindings, no PyTorch. Vulkan is driven directly through `ctypes`.

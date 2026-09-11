@@ -81,9 +81,9 @@ def main():
     if dev.features.get("cooperativeMatrix"):
         speed = "matrix units present: the cooperative-matrix path will be used"
     else:
-        speed = ("no matrix units: the scalar fallback will be used, which costs "
-                 "about 6%\n         on a real training step, not the 2-3x the peak "
-                 "numbers imply")
+        speed = ("no matrix units: the scalar fallback will be used. Matrix units are\n"
+                 "         worth -5% to +18% on a real training step depending on model\n"
+                 "         shape, median about 8%, not the 2-3x the peak numbers imply")
     print(f"VERDICT: vkgrad will train on this device.\n         {speed}")
     if not dev.features.get("shaderBufferFloat32AtomicAdd"):
         print("         Without float atomics the MLP path works; the transformer")

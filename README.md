@@ -4,6 +4,10 @@ A training stack for GPUs that aren't NVIDIA, built on Vulkan compute.
 <!-- TODO: screenshot or GIF of examples/mnist.py racing the CPU, above the fold. -->
 
 **Result:** a 315.4M-parameter transformer trains on an integrated laptop GPU, in 7.31 GiB, with no CUDA and no ROCm
+<!-- This one is a single run recorded in prose at bench/RESULTS.md section 40. Unlike the
+     MNIST row it has no committed artefact and no script that reproduces it, which is the
+     standard this repo sets for itself in .gitignore: "A published number needs an artefact
+     in the repo". Either commit a bench/frontier.json sweep or keep the hedge. -->
 **Stack:** Vulkan compute · SPIR-V · GLSL · cooperative matrix · Python · ctypes · numpy
 **Run it:** `python -m examples.mnist --synthetic`
 
@@ -21,9 +25,9 @@ reach. Raw numbers in [bench/RESULTS.md](bench/RESULTS.md), the write-up is [RES
 
 | | |
 |---|---|
-| MNIST, full training run | **97.6%** test accuracy (5 runs: 97.51 to 97.78) in 1.6 s of wall time |
+| MNIST, full training run | **97.6%** test accuracy (5 runs: 97.51 to 97.71) in 1.6 s of wall time |
 | against the CPU sharing the same die and DRAM | **5.3x** faster (5 runs: 4.90 to 5.65) |
-| largest model trained | **315.4M** parameters in 7.31 of 11.8 GiB |
+| largest model trained | **315.4M** parameters in 7.31 of 11.8 GiB (one unreproduced run, see below) |
 | sustained throughput, 12-minute run | **21,382 tokens/s** |
 
 At a Chinchilla-optimal 20 tokens per parameter, that sustained rate puts a 10.8M-parameter model
@@ -79,9 +83,9 @@ examples/mnist.py  trains an MLP, races it against the same model on the CPU
 | 0. toolchain | done. Vulkan SDK, `glslc` compiles `GL_KHR_cooperative_matrix` |
 | 1. runtime + zero-copy allocator | done, verified |
 | 2. WMMA matmul + autotuner | done, verified. Forward and both backward transposes |
-| 3. autograd + training | done. MNIST 97.69%, and a 1.84M param transformer trains |
+| 3. autograd + training | done. MNIST 97.6% (5-run median), and a 1.84M param transformer trains |
 | 4. multi-device without NCCL | mechanism verified: DDP over shared host memory, 0 bytes transferred |
-| 5. runs without matrix units | scalar fallback, exact vs numpy, ~6% slower on a real step |
+| 5. runs without matrix units | scalar fallback, exact vs numpy, within about 8% on a real step |
 
 ## Running the tests
 
@@ -108,7 +112,7 @@ matrix units.
   intention, not a test result.
 - **Matrix units are worth less than the peak numbers imply.** On a real training step, cooperative
   matrix is worth between -5% and +18% depending on model shape, median around 8%, rather than the
-  2.9x the peak FLOPS suggest. The scalar fallback runs exact against numpy and costs about 6%.
+  2.9x the peak FLOPS suggest. The scalar fallback runs exact against numpy.
 - Above roughly 85M parameters, training from scratch stops being practical on this hardware
   (7 days and rising), though the models still fit and still run, so fine-tuning at those sizes
   remains on the table.
