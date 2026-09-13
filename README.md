@@ -70,6 +70,7 @@ kernels.py         matmul generators (direct + LDS), fused elementwise kernels, 
 autograd.py        tape, Linear/MLP, fused AdamW, recorded TrainStep
 tkernels.py        LayerNorm, causal attention softmax, head permutes, embeddings
 transformer.py     decoder-only transformer: attention, blocks, GPT
+hf_gpt2.py         Hugging Face GPT-2 .safetensors into transformer.GPT, numpy only
 fallback.py        scalar tiled matmul for GPUs with no matrix units
 dataparallel.py    DDP over shared host memory: replicated weights, atomic gradient arena
 check_device.py    will vkgrad run on this GPU, and what will it get
@@ -83,7 +84,7 @@ examples/mnist.py  trains an MLP, races it against the same model on the CPU
 | 0. toolchain | done. Vulkan SDK, `glslc` compiles `GL_KHR_cooperative_matrix` |
 | 1. runtime + zero-copy allocator | done, verified |
 | 2. WMMA matmul + autotuner | done, verified. Forward and both backward transposes |
-| 3. autograd + training | done. MNIST 97.6% (5-run median), and a 1.84M param transformer trains |
+| 3. autograd + training | done. MNIST 97.6% (5-run median), a 1.84M param transformer trains, and GPT-2 small checkpoints load: argmax 89/89 against an independent numpy forward (`test_hf_gpt2.py`) |
 | 4. multi-device without NCCL | mechanism verified: DDP over shared host memory, 0 bytes transferred |
 | 5. runs without matrix units | scalar fallback, exact vs numpy, within about 8% on a real step |
 
@@ -97,7 +98,11 @@ python test_autograd.py
 python test_transformer.py
 python test_shared.py
 python test_accum.py
+python test_hf_gpt2.py
 ```
+
+`test_hf_gpt2.py` needs `tiktoken` and the GPT-2 and CodeGPT-small-py checkpoints,
+which `python hf_gpt2.py` downloads with `huggingface_hub` into `hf_gpt2.MODELS`.
 
 Set `VKGRAD_NO_COOPMAT=1` to force the scalar path and check the fallback on hardware that has
 matrix units.

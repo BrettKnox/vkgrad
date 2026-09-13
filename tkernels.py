@@ -313,6 +313,11 @@ def make_transformer_kernels(dev):
          ("out32", "f32", "writeonly")],
         "out32[i] = a[i] + b[i];")
 
+    # In place, so the untied head's (B*T, V) logits need no second buffer.
+    K["add_bias"] = Elementwise(
+        dev, "add_bias", [("x", "f32", ""), ("bias", "f32", "readonly")],
+        "x[i] += bias[i % p.ncol];", push=[("ncol", "uint")])
+
     K["to16"] = Elementwise(
         dev, "to16",
         [("src", "f32", "readonly"), ("dst", "f16", "writeonly")],

@@ -169,12 +169,16 @@ def run(dev, tie):
         ids = rng.integers(0, vocab, rows).astype(np.uint32)
         tgt = rng.integers(0, vocab, rows).astype(np.uint32)
         # Nonzero biases. At their zero init, a bias that forward never adds
-        # still passes every check here; the qkv bias did exactly that. head.b
-        # stays zero because forward does not apply it (see GPT).
+        # still passes every check here; the qkv bias and the untied head's
+        # bias both did exactly that. head.b is drawn at std 1.0 so that the
+        # loss check itself catches a forward pass that drops it. At 0.1 the
+        # test still failed without the head bias add, but on most hash seeds
+        # only at the gradient checks, not the loss.
         rb = np.random.default_rng(1)
         for p in model.params():
-            if p.name.endswith(".b") and p.name != "head.b":
-                p.set((rb.standard_normal(p.shape) * 0.1).astype(np.float32))
+            if p.name.endswith(".b"):
+                s = 1.0 if p.name == "head.b" else 0.1
+                p.set((rb.standard_normal(p.shape) * s).astype(np.float32))
 
         idb = ctx.buf(rows * 4, "shared")
         idb.array(np.uint32, (rows,))[:] = ids

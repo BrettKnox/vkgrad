@@ -1021,6 +1021,17 @@ training on hardware people already own was never that the silicon cannot do it.
 
 ## 41. Sustained throughput, and an over-correction
 
+**Corrected in section 52.** The validation losses here were measured by an
+`evaluate()` that also ran AdamW on each validation batch: by step 7,500 the model
+had taken 300 optimiser steps on validation data. Re-run on today's code with
+forward-only evaluation at `PYTHONHASHSEED` 0 to 2, this configuration ends at
+validation 1.0068 to 1.0351, not 0.9123, and the pre-fix evaluation reads 0.023
+to 0.086 lower than the fixed one at every matched step. Today's code also trains
+to a higher loss than this run at matched steps, for reasons section 52 does not
+separate, so that range is not this run with the defect removed. The claim below
+that validation reaches 0.91 in 12 minutes does not stand. The throughput figures
+were not re-measured.
+
 Section 40's time-to-train figures came from step times measured as best-of-four
 back-to-back submits. `examples/train_lm.py` runs the same 10.8M model for a
 wall-clock budget with real data loading, loss readback, held-out validation and
@@ -1069,6 +1080,12 @@ no CUDA and no ROCm.
 
 
 ## 42. What 12 minutes of training on a laptop iGPU produces
+
+**See section 52.** The checkpoint sampled here is section 41's, so it had also
+taken 300 optimiser steps on validation batches (the corpus's last 52 files,
+`urllib/request.py` to `zoneinfo`). The prime, a tkinter test file, is in the
+training split, and 7% of Chinchilla-optimal stands with those steps counted:
+16.0M of 216M tokens.
 
 A validation loss is abstract. `examples/sample_lm.py` loads the checkpoint and
 generates, which is also the only check that catches a model optimising
@@ -1124,6 +1141,15 @@ already builds. Measured on the 780M:
 | 512 | 2 | 1024 | 1078.7 ms | 949 | 5.54 GiB |
 | 1024 | 2 | 2048 | 3181.2 ms | 644 | 10.05 GiB |
 
+**Corrected in section 51.** Timed for 240 s, the same model sustains 975.4,
+854.5, 812.4 and 615.2 tokens/s at 256x2, 256x4, 512x2 and 1024x2, measured while
+other processes used 43.7 to 63.2% of the same GPU; this section recorded neither
+its method nor its conditions. 256x8 was not re-measured. Memory reproduces. The
+956-1,117 spread below is within 0.2% of the rates from the median and the fastest
+step of one 240 s run, so it may be two statistics of one run rather than
+cross-run variation. That is an inference: neither method was recorded, and
+458.5 ms is faster than all 458 steps of that run.
+
 **~956-1,117 tokens/s at 3.92 GiB** (the spread is cross-run variation; see
 section 46). In fine-tuning terms:
 
@@ -1143,9 +1169,17 @@ monotonically with batch and called it an inversion of standard practice.
 Re-measured, throughput rises or stays flat with batch until the footprint nears
 the memory ceiling, then collapses: 956, 965, then 669 tokens/s at batch 2, 4, 8.
 On a smaller model it rises all the way to batch 4. Ordinary behaviour, with the
-ceiling arriving sooner than on a discrete card.
+ceiling arriving sooner than on a discrete card. Section 51's sustained runs do
+not confirm the flat part: 975.4 then 854.5 tokens/s at batch 2 and 4, one
+process each.
 
 ### What this does not claim
+
+**Corrected in section 50.** Loading is written now: `hf_gpt2.py` reads the
+checkpoint, tiktoken supplies the BPE tokenizer, and `GPT(tie=True)` ties the
+head (124M parameters). A tied model is also about 14% faster than this untied
+one (section 51, with its caveat on GPU load), so the figures above are not what a
+GPT-2 fine-tune sees.
 
 This measures the architecture with random weights. Loading actual GPT-2
 checkpoints would additionally need the weight file and a BPE tokenizer, neither
@@ -1282,6 +1316,13 @@ At GPT-2 scale, clean processes:
 
 Flat, then a collapse at batch 8. The originally published 1,117 / 844 / 668 was
 again cross-run: batch 2 measures 956 here.
+
+**Revisited in section 51.** 956 and 1,117 are within 0.2% of the rates from the
+median and the fastest step of one 240 s run at batch 2, which would explain them
+as two statistics of one run rather than cross-run variation. That is an
+inference, since neither method was recorded, and it has a misfit: 1,117's
+458.5 ms step is faster than all 458 steps of that run. The same run's sustained
+rate is 975.4, measured while other processes used 60.5% of the same GPU.
 
 **The correct statement**: throughput rises or stays flat with batch until the
 footprint approaches the memory ceiling, then collapses. That is ordinary
@@ -1504,3 +1545,350 @@ Two consequences worth acting on:
 Cost of this entire result: one 227 MB download and about ten minutes. It should
 have been the first thing done about the 3 TFLOPS question rather than the
 tenth.
+
+## 50. Real GPT-2 weights load, and two biases the forward pass never added
+
+Section 43 listed what loading a real checkpoint would need: the weight file, a
+tokenizer, and weight tying. All three exist now, and writing them exposed a
+defect that every gradient check in this file had missed.
+
+`hf_gpt2.py` reads `.safetensors` with numpy alone (an 8-byte header length, a
+JSON header, then raw little-endian tensors, memory-mapped) and maps Hugging
+Face's GPT-2 names onto `transformer.GPT` at pinned revisions. `GPT(tie=True)`
+makes the head the token embedding transposed, as GPT-2 does: at seq 512 the
+tied model has 124,058,112 parameters against 162,717,280 untied
+(`bench/section43_remeasure.json`, arms B and A). The BPE tokenizer is not
+written here. It is tiktoken's `gpt2` encoding, seeded from the checkpoint's own
+`merges.txt` and `vocab.json` after a sha256 check.
+
+`test_hf_gpt2.py` checks it against an independent numpy GPT-2 that shares only
+the file reader: no vkgrad kernel, and not the name mapping.
+
+| check | result |
+|---|---|
+| argmax over an 89-token paragraph | 89/89 agree |
+| max logit difference | 0.0970, with logits spanning -191.7 to 60.2 |
+| perplexity over 88 predictions | vkgrad 23.2020, numpy 23.1802 |
+| 20-token greedy continuation | identical |
+| CodeGPT-small-py, 64 random ids | 64/64 agree, max difference 0.0211 |
+
+`attn.c_proj` is 768 x 768, so a transposed load passes every shape check. The
+test transposes it on purpose: max logit difference 173.76, argmax 12/89,
+perplexity 1803.3. The check can fail.
+
+### The qkv bias was never added
+
+`split_qkv`, the fused kernel that cuts the qkv projection into the three
+attention operands, did not add the projection's bias. Backward computed its
+gradient and AdamW updated it, so every training run here moved a parameter the
+forward pass ignored. Invisible at a zero bias, wrong for any checkpoint whose
+bias is not zero.
+
+`test_transformer.py` could not see it, and not because the reference was wrong:
+the numpy model does add the bias (`h @ qkv.W + qkv.b`). Every bias started at
+its zero init, and the test compares one forward and backward from init, so a
+forward pass that skipped the bias and a reference that added it computed the
+same thing. At 40ad1b8 the test passes on the defective code, all 20 gradient
+tensors, at every hash seed tried: from a `git archive` of 40ad1b8 at
+`PYTHONHASHSEED` 0 to 4, worst gradient error 1.39e-03 to 3.44e-03. The seed
+matters because `Dense` initialises from `hash(name)`, which Python randomises
+per process.
+
+340bb29 draws every bias except the untied head's from a normal distribution (std
+0.1) before the check. Against that test, 340bb29's own code with only the three
+`bias[...]` terms in `split_qkv` multiplied by zero, run with the loss assertion
+reporting instead of stopping so the gradient checks are reached (untied head,
+from a `git archive` of 340bb29):
+
+| `PYTHONHASHSEED` | loss, tolerance 5e-3 | gradient tensors failing, tolerance 3e-2 | their errors |
+|---|---|---|---|
+| 0 | 1.24e-03, passes | 18 of 20 | 7.55e-02 to 2.55e-01 |
+| 1 | 4.39e-04, passes | 18 of 20 | 1.42e-01 to 2.68e-01 |
+| 2 | 2.07e-04, passes | 18 of 20 | 1.30e-01 to 2.98e-01 |
+| 3 | 1.03e-05, passes | 18 of 20 | 4.53e-02 to 1.85e-01 |
+| 4 | 6.26e-04, passes | 18 of 20 | 1.15e-01 to 3.08e-01 |
+
+The loss check alone would have missed it on every seed. Only the gradients catch
+it.
+
+### The same blind spot, a second time
+
+340bb29's test drew nonzero biases for everything except the untied head, with a
+comment saying why: forward did not apply `head.b` either. `GPT.forward`
+returned the head's `x @ W` and never added its bias, while backward computed a
+gradient for it. Same defect, second place, and the test had been written around
+it rather than against it.
+
+`tkernels.py` now has an in-place `add_bias`, dispatched once after the head, and
+the test draws `head.b` at std 1.0. Against that test, 340bb29's `transformer.py`
+with everything else current fails the loss check before any gradient is
+compared: relative error 5.61e-02, 4.71e-02, 4.53e-02, 5.98e-02 and 5.94e-02 at
+`PYTHONHASHSEED` 0 to 4.
+
+With `head.b` drawn at std 0.1 like the other biases, the same code still fails
+at all six of seeds 0 to 5, but only two
+(seeds 1 and 2, at 5.97e-03 and 6.29e-03) fail the loss check. The other four
+pass it at 4.6e-03 to 4.8e-03 and are caught by the gradient checks, all 20
+tensors at 3.35e-02 to 2.05e-01. Std 1.0 is what makes the loss check itself
+catch a dropped head bias.
+
+### What it touches
+
+The runs in sections 41, 42 and 44 trained models whose attention and untied head
+had no working bias. Their losses and throughputs are real measurements of that
+model, not of the one the code described. Section 52 re-runs section 41's
+configuration with both biases working, but does not separate their effect from
+the hash seed and other code changes since, and found a second defect in how
+those runs measured validation loss. A
+checkpoint trained before this fix carries biases that forward never used;
+resuming or sampling one now applies them, with an effect that has not been
+measured. The throughput cost of adding both biases is in section 51: at most
+about 3%, not resolved from noise.
+
+Eleventh correction, and the second of this file's two usual causes: a check run
+in one configuration, every bias at zero, and read as covering all of them.
+"Gradients verified against numpy" (section 40) was true only where the defect
+could not show.
+
+## 51. Section 43 re-measured: best steps, not sustained throughput
+
+Commit 340bb29 recorded 640 to 693 tokens/s fine-tuning loaded GPT-2 weights at
+seq 512 to 1024, below section 43's 949 with random weights, and did not isolate
+why. A commit message cannot be amended, so this section is its correction too.
+
+`bench/section43_remeasure.py` runs every measurement as its own process,
+samples CPU load before and during each, and writes every run with its per-step
+times to `bench/section43_remeasure.json`. Section 43's own script is not in the
+repo: commit 427284e changed only this file. The committed JSON keeps per-run
+totals of other processes' CPU and GPU use, plus the benchmark's own CPU seconds
+and GPU share. Other processes' names, pids and CPU seconds were stripped before
+committing, and the script now prints those to the console and writes only the
+totals. Every number below recomputes from the JSON except the two load facts
+marked as notes, which rest on the stripped per-process data.
+
+### Sustained rates
+
+Section 43's model (random weights, untied head), each shape timed for 240 s in
+one process after three untimed steps. The last two rate columns come from the
+same run's per-step times. Every run in this section was measured while other
+processes used 43.7 to 63.2% of the same GPU (see "The GPU was not idle" below).
+
+| seq x batch | sec 43 | sec 46 | **sustained** | from median step | from fastest step | memory, 43 / now |
+|---|---|---|---|---|---|---|
+| 256 x 2 | 1,117 | 956 | **975.4** | 954.6 | 1,115.0 | 3.92 / 3.920 GiB |
+| 256 x 4 | 844 | 965 | **854.5** | 822.7 | 972.1 | 5.12 / 5.116 GiB |
+| 256 x 8 | 668 | 669 | not measured | | | 7.51 / not measured |
+| 512 x 2 | 949 | | **812.4** | 782.9 | 928.6 | 5.54 / 5.541 GiB |
+| 1024 x 2 | 644 | | **615.2** | 638.3 | 678.5 | 10.05 / 10.048 GiB |
+
+Nothing decays over the run: the second half of every one is at least as fast as
+the whole (979.4, 855.7, 820.9, 619.2). Memory reproduces to the figure section
+43 rounded to.
+
+**949 is not a sustained rate.** Sustained, 512x2 is 812.4, 14% lower. Three
+interleaved 45 s runs of the same model gave 828.7, 799.5 and 807.4. Section
+43's 1078.7 ms step equals the fastest single step in the 426 steps timed for
+this model at this shape, preflight included, and that step occurred once, in
+the 40ad1b8 arm below.
+
+**The two published 256x2 figures sit within 0.2% of two statistics of one run.** Within a
+single 240 s run, the rate from the median step is 954.6 and from the fastest
+step 1,115.0. Section 46's 956 and section 43's 1,117 sit within 0.2% of them.
+Section 46 called that gap cross-run variation. One section taking a median and
+the other a best step explains it at least as well. Neither method is recorded,
+so this is an inference, and it has a clear misfit: section 43's 458.5 ms is
+faster than all 458 steps of that run, whose fastest is 459.2 ms.
+
+The fastest step overstates the sustained rate by 10 to 14% at every shape
+measured. Section 41 found best-of-four step times 7% optimistic on the 10.8M
+model; at GPT-2 scale the same error is twice the size.
+
+**Step times at 512x2 have two modes.** Counting a step as fast when it is within
+8% of its run's fastest, fast steps are 14 to 49% of each 512x2 run, and the
+median slow step is 1.136 to 1.183x the median fast step, so a fast step is 12.0
+to 15.5% quicker. That holds in every arm below, including 40ad1b8, so it
+predates this work. The other shapes are less clean. At 256x2 and 256x4 the same
+ratio is 1.127 and 1.164. At 1024x2 the rule counts 66% of steps fast at 1.081x,
+but that is not two modes: 63 of 73 steps spread continuously from 3018 to
+3487 ms, and 10 sit apart at 4082 to 4309 ms. Section 43's step times do not
+consistently sit on a mode either: 458.5 ms is faster than every step of the
+256x2 run, 1078.7 ms is the single fastest of the 426 steps above, 1213.7 ms
+falls between the 256x4 run's fast and slow medians (1076.2 and 1252.3 ms), and
+3181.2 ms is inside the 1024x2 spread. The cause of the modes is not established.
+
+CPU, the confound 340bb29 suspected, was quiet: other processes averaged 0.40 to
+1.15 of 16 logical cores across every run.
+
+### The GPU was not idle
+
+Other processes' GPU engine use on the same iGPU, summed per run over every
+process sampled at 1% or more, was 43.7 to 63.2% in all 23 non-preflight runs,
+the failed 256x8 run included. That was the Claude desktop app and dwm, the
+desktop compositor, plus at most 1.7% from a browser. In the preflight probes it
+was 5.5 to 17.3%, but those probes fired as their 10 s runs ended or after (the
+benchmark process itself sampled at or below 0%, and one probe never fired), so
+they describe the machine without the benchmark running, not a quieter run.
+Which processes carried the load, and when the probes fired, are notes
+(`analysis.load_notes` in the JSON): the per-process samples behind them were
+stripped, so neither can be recomputed from the committed file.
+
+So every absolute rate in this section, the sustained column included, was
+measured under that load, and section 43 recorded nothing about its own
+conditions: how much of any gap to section 43 comes from load is unknown.
+
+The arm ratios below are the fairer comparison, since every arm ran interleaved
+under the load. It was not uniform across arms, though: 44.2 to 51.6% in the tied
+arms (B, C, F) against 56.6 to 63.0% in the untied ones (A, D, E). Whether it is
+display work competing for the GPU, which would have slowed the untied arms more,
+or an accounting effect of the benchmark's own use of the shared engine was not
+separated.
+
+### Loaded weights are not slower. A tied head is faster.
+
+Six arms at 512x2, 45 s each, as separate processes in the order ABCDEF, FEDCBA,
+ABCDEF:
+
+| arm | model | tokens/s, 3 runs | median | vs A |
+|---|---|---|---|---|
+| A | random weights, untied (section 43's model) | 828.7, 799.5, 807.4 | 807.4 | 1.000 |
+| B | loaded GPT-2, tied | 914.4, 926.5, 927.7 | 926.5 | 1.148 |
+| C | random weights, tied | 895.0, 918.7, 917.4 | 917.4 | 1.136 |
+| D | loaded GPT-2, untied | 808.0, 808.7, 813.1 | 808.7 | 1.002 |
+| E | random weights, untied, 40ad1b8 (neither bias add) | 816.8, 838.0, 834.2 | 834.2 | 1.033 |
+| F | `bench/hf_gpt2_speed.py` unchanged (loaded, tied) | 932, 952, 940 | 940 | 1.164 |
+
+  * **Tying the head is the whole difference.** C over A is 1.136. Loaded against
+    random weights is 1.002 untied (D over A) and 1.010 tied (B over C). The tied
+    model also allocates 4.893 GiB against 5.541.
+  * **The 640 to 693 did not reproduce at 512x2.** The same unchanged script
+    measures 932 to 952. Its median is 1.5% above arm B's, and single runs sit
+    0.6 to 2.8% above B's median. What produced the
+    original range is not established. 340bb29 quoted it for seq 512 to 1024 and
+    no tied run at seq 1024 was made, so part of it may be a different
+    configuration rather than a failure to reproduce.
+  * **The bias fixes cost at most about 3%, not resolved from noise.** E over A was
+    0.986, 1.048 and 1.033 round by round, and 1.007 by pooled median step. Arm E
+    ran from a temporary worktree of 40ad1b8 that no longer exists; the artefact
+    records the label, not a hash of the code that ran.
+
+### 256x8 was not re-measured
+
+The run lost the device: `vkQueueSubmit` returned VkResult -4
+(`VK_ERROR_DEVICE_LOST`) after 100 s of process wall time in a 240 s run, and
+Windows logged a display-driver timeout. It was not retried, because a retry
+could reset the display driver again. Section 43's 668 and section 46's 669 stand
+unconfirmed.
+
+### What changes
+
+  * Under the GPU load above, section 43's rates are the sustained column. Its
+    fine-tuning table was computed from 956 and stands for that model at 256x2
+    under that load, about 2% conservative (975.4 gives 17 minutes, 2.8 hours and
+    14.2 hours). An actual GPT-2 fine-tune is tied, and at seq 512 batch 2
+    measures 926.5, 18 minutes per million tokens.
+  * Section 46's "flat" at GPT-2 scale is not confirmed: 854.5 at batch 4 is 12.4%
+    below 975.4 at batch 2. One process each, and section 48 measured
+    cross-process spread of 1.13-1.22x on matmul shapes, so this does not settle
+    the direction either.
+
+Twelfth correction. The same error as section 41, twice the size: a statistic of
+step times quoted as throughput, with the method that produced it not recorded
+next to the number.
+
+## 52. Validation in train_lm.py was also training, on the validation set
+
+`examples/train_lm.py`'s `evaluate()` submitted the training graph. With
+`--accum 1`, the default and the configuration of sections 41 and 42, that graph
+ends in the fused AdamW step, so every validation batch was also an optimiser
+step on validation data. With `--accum` above 1 it submitted the microbatch
+graph, which pushes each validation batch's gradients into the arena for the
+next optimiser step to apply. The loss read back for a batch was computed before
+its own update, but every later validation batch, and all training after it, ran
+on weights already fitted to the validation batches before it.
+
+Confirmed before the fix, on a 27,024-parameter GPT with the graphs recorded as
+`main()` recorded them and the body of `evaluate()` copied verbatim: one call
+changed all 30 parameter tensors with `--accum 1` (max |delta| 1.725e-02 at
+PYTHONHASHSEED=0, 1.730e-02 on a rerun at the same seed), and with `--accum 2`
+left the weights alone but took the arena from all zeros to a max |x| of 1.078
+(seed 0, one run). These are control magnitudes showing the defect, not results.
+
+The fix: `GPT.record(..., backward=False)` records the forward pass and the loss
+and nothing else, `train_lm.eval_graph` records the validation graph with it, and
+`evaluate()` submits that. `test_accum.py` checks that evaluation leaves weights
+and arena bit-for-bit unchanged and returns the training forward's loss. It also
+submits the two graphs evaluation used to, so the check is seen to fail: they
+move the weights (2.35e-03 at PYTHONHASHSEED=0) and the arena (3.38e-01,
+4.79e-01 and 4.56e-01 at seeds 0 to 2; 4.91e-01 and 8.94e-01 in two unpinned
+runs).
+
+At section 41's cadence, one evaluation of 20 batches every 500 steps, its
+7,518-step run made 15 evaluations before the final one: 300 optimiser steps and
+614,400 tokens of validation batches, drawn with replacement from an
+822,815-token validation split.
+
+### Re-measured
+
+Section 41's configuration on today's code, both biases from section 50 working:
+
+```
+python -m examples.train_lm --minutes 12 --eval-every 500 --resume RUN_DIR
+```
+
+Defaults are 384d x6, 6 heads, seq 256, batch 8, vocab 96. Section 41's own log
+(`runs/lm_384x6/log.jsonl`, not committed) evaluated every 500 steps rather than
+the default 250, so these do too. Each of `PYTHONHASHSEED` 0, 1 and 2 ran twice as
+separate processes: with the fixed evaluation, and from a copy of the working
+tree taken before the fix. Batches come from a fixed generator, so a pair trains
+on the same batches and differs by its evaluation plus run-to-run noise, which is
+not zero: the same code at the same seed gives train loss 3.184825 and 3.184793
+at step 100, and 2.430466 and 2.432321 at step 300. Every log is in
+`bench/section52_eval.json`, section 41's rows included.
+
+Train (mean of the last 500 steps) and validation loss, as ranges over the three
+seeds:
+
+| step | section 41, train / val | fixed evaluation, train | val | pre-fix evaluation, train | val |
+|---|---|---|---|---|---|
+| 500 | 2.5573 / 2.1464 | 2.5604 to 2.5782 | 2.2608 to 2.3021 | 2.5610 to 2.5761 | 2.2216 to 2.2744 |
+| 2500 | 1.2084 / 1.2119 | 1.2852 to 1.5397 | 1.3108 to 1.5571 | 1.2693 to 1.5356 | 1.2542 to 1.5212 |
+| 5000 | 0.9531 / 0.9845 | 0.9653 to 1.0660 | 1.0395 to 1.1078 | 0.9625 to 1.0600 | 0.9857 to 1.0603 |
+| 6500 | 0.8978 / 0.9853 | 0.9098 to 0.9652 | 1.0629 to 1.1167 | 0.9053 to 0.9578 (2 seeds) | 0.9902 to 1.0428 (2 seeds) |
+| end | 7,518 steps: 0.8717 / 0.9123 | 6,889 to 7,108 steps: 0.8888 to 0.9367 | 1.0068 to 1.0351 | 5,964 to 7,157 steps: 0.8832 to 0.9356 | 0.9196 to 0.9906 |
+
+The end rows are the last 100 steps' mean and a final 20-batch evaluation, as
+section 41 reported them. No run reached step 7,500 in 12 minutes.
+
+  * **The old evaluation understated validation loss.** Paired at the same seed,
+    it read 0.023 to 0.086 lower at all 37 matched rows (steps 500 to 6,500; 6,000
+    and 6,500 have two pairs, because the pre-fix seed 1 run stopped at 5,964).
+    Train loss differences have no consistent sign, -0.049 to +0.019. At step 500
+    the gap is already 0.023 to 0.039 while train loss agrees within 0.0021, so
+    that part can only come from within the one evaluation, each batch scored
+    after steps on the batches before it, or from run-to-run noise.
+  * **Section 41's validation 0.9123 does not stand.** With forward-only
+    evaluation this configuration ends at 1.0068 to 1.0351, and at step 6,500
+    reads 1.0629 to 1.1167 against section 41's 0.9853. The pre-fix evaluation on
+    the same code lands near section 41, and its gap between validation and train
+    loss at step 6,500, 0.085 on both seeds, matches section 41's 0.0875. With the
+    fix that gap is 0.152 to 0.158.
+  * **Train loss is higher than section 41's with either evaluation**, on all three
+    seeds: by 0.012 to 0.113 at step 5,000 with the fix. The evaluation cannot
+    explain that. Today's code adds both biases, the seeds differ from section
+    41's unrecorded one, and other code has changed since 4ab6f0a; this section
+    does not separate them. The seed alone spans 0.10 of train loss at step 5,000
+    (0.9653 to 1.0660). So 1.0068 to 1.0351 is today's code with honest
+    validation, not section 41's run with the defect removed.
+  * **Tokens/s is not measured here.** The runs made 16,963 to 20,357 tokens/s
+    with the CPU shared with other work, and the pre-fix seed 1 run lost about a
+    minute between steps 2,000 and 2,500. Section 41's 21,382 was measured with
+    300 full training steps of evaluation inside its timed loop, where evaluation
+    is now forward only; its throughput is not re-measured.
+
+Section 42's checkpoint is section 41's, and the training split, the tkinter prime
+and 7% of Chinchilla-optimal are unaffected (see the note there). Section 44's
+10.8M comparison is throughput only.
+
+Thirteenth correction, and a new kind: a measurement that changed the thing it
+measured. Every validation number `train_lm.py` has printed was taken by a model
+that had just trained on the validation batches before it.

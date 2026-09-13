@@ -65,6 +65,52 @@ def encode(data, vocab):
     return table[data], {int(table[b]): chr(b) for b in np.sort(keep)}
 
 
+def accum_graphs(dev, model, opt, ga, idb, tgb):
+    """Record the microbatch and step graphs for gradient accumulation.
+
+    The arena is device memory and holds whatever was there before, so it is
+    zeroed once before the first microbatch, as bench/hf_gpt2_speed.py does.
+    The step graph re-zeroes it after every apply.
+    """
+    gz = dev.graph("zero")
+    ga.record_zero(gz)
+    gz.finish()
+    gz.submit()
+    gmicro = dev.graph("micro")
+    model.record(idb, tgb, gmicro)
+    ga.record_push(gmicro)
+    gmicro.finish()
+    gstep = dev.graph("step")
+    ga.record_apply(gstep, opt)
+    ga.record_zero(gstep)
+    gstep.finish()
+    return gmicro, gstep
+
+
+def eval_graph(dev, model, idb, tgb):
+    """Record the validation graph: forward and loss, no gradients.
+
+    Evaluation used to submit the training graph, so with --accum 1 every
+    validation batch ran an AdamW step, and with --accum > 1 its gradients were
+    pushed into the arena and applied at the next optimiser step.
+    """
+    g = dev.graph("eval")
+    model.record(idb, tgb, g, backward=False)
+    g.finish()
+    return g
+
+
+def evaluate(g, model, idv, tgv, batches):
+    """Mean loss over (ids, targets) batches, submitting g for each."""
+    tot = 0.0
+    for x, y in batches:
+        idv[:] = x
+        tgv[:] = y
+        g.submit()
+        tot += model.read_loss()
+    return tot / len(batches)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dmodel", type=int, default=384)
@@ -128,17 +174,11 @@ def main():
         # throughput falls as batch grows, because the machine is
         # bandwidth-bound and activation traffic scales with batch.
         ga = GradAccum(ctx, params, accum=accum)
-        gmicro = dev.graph("micro")
-        model.record(idb, tgb, gmicro)
-        ga.record_push(gmicro)
-        gmicro.finish()
-        gstep = dev.graph("step")
-        ga.record_apply(gstep, opt)
-        ga.record_zero(gstep)
-        gstep.finish()
+        gmicro, gstep = accum_graphs(dev, model, opt, ga, idb, tgb)
         g = gmicro
         print(f"microbatch {gmicro.n_dispatch} dispatches x{accum}, "
               f"step {gstep.n_dispatch}, effective batch {B * accum}")
+    geval = eval_graph(dev, model, idb, tgb)
     print()
 
     start_step = 0
@@ -157,15 +197,9 @@ def main():
         return arr[idx].reshape(-1).astype(np.uint32), \
             arr[idx + 1].reshape(-1).astype(np.uint32)
 
-    def evaluate(n_batches=20):
-        tot = 0.0
-        for _ in range(n_batches):
-            x, y = batch_from(val)
-            idv[:] = x
-            tgv[:] = y
-            g.submit()
-            tot += model.read_loss()
-        return tot / n_batches
+    def val_loss(n_batches=20):
+        return evaluate(geval, model, idv, tgv,
+                        [batch_from(val) for _ in range(n_batches)])
 
     def train_step(lr):
         """One optimiser step, over `accum` microbatches."""
@@ -205,7 +239,7 @@ def main():
             if step % args.eval_every == 0:
                 el = time.perf_counter() - t0
                 tps = tokens_done / el
-                vl = evaluate()
+                vl = val_loss()
                 tr = float(np.mean(losses[-args.eval_every:]))
                 left = max(budget - el, 0)
                 print(f"{step:7d}{tr:9.4f}{vl:9.4f}{tps:10,.0f}"
@@ -226,7 +260,7 @@ def main():
           f"{el / 60:.1f} min = {tokens_done / el:,.0f} tokens/s")
     if losses:
         print(f"  loss {losses[0]:.4f} -> {np.mean(losses[-100:]):.4f}   "
-              f"val {evaluate():.4f}")
+              f"val {val_loss():.4f}")
     chinchilla = 20 * n_par
     print(f"  Chinchilla-optimal for {n_par:,} params is {chinchilla:,} tokens: "
           f"{chinchilla / (tokens_done / el) / 3600:.1f} h at this rate")

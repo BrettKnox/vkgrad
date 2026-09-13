@@ -11,6 +11,11 @@ scratch/
 # and this file holds only the command, the run count and the numbers: no hostname, no
 # username, no process list, which is what the exclusions above and below exist to keep out.
 !bench/mnist-repro.json
+# RESULTS.md sections 50 and 51. Per-run totals only: other processes' names, pids and CPU
+# seconds were stripped before committing. The benchmark's own CPU seconds and GPU share stay.
+!bench/section43_remeasure.json
+# RESULTS.md section 52: training-loss logs only.
+!bench/section52_eval.json
 
 # Benchmark run output: contains hostname, username and a process list.
 bench/runs/

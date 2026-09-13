@@ -264,8 +264,8 @@ class GPT:
         self.lnf = LayerNorm(ctx, self.rows, D, "lnf")
         # tie=True: the head is the token embedding transposed, as in GPT-2.
         # Drops pad_vocab*D parameters (38.6M at GPT-2's vocabulary) with their
-        # gradients and Adam moments. Untied, the head's bias is computed a
-        # gradient but never added in forward.
+        # gradients and Adam moments. Untied, the head is a Dense with a bias,
+        # which forward adds like every other Dense caller does.
         self.tie = tie
         if tie:
             self.logits = ctx.buf(self.rows * self.pad_vocab * 4)
@@ -300,7 +300,10 @@ class GPT:
             x = b.forward(x, graph=graph)
         h = self.lnf.forward(x, graph=graph)
         if not self.tie:
-            return self.head.forward(h, graph=graph)
+            logits = self.head.forward(h, graph=graph)
+            TK["add_bias"]([logits, self.head.b.w32], self.rows * self.pad_vocab,
+                           self.pad_vocab, graph=graph)
+            return logits
         self.h16 = h
         R, V, D = self.rows, self.pad_vocab, self.D
         # logits = h @ tok^T; tok is stored V x D, hence trans_b.
@@ -308,11 +311,18 @@ class GPT:
             h, self.tok.w16, self.logits, R, V, D, graph=graph)
         return self.logits
 
-    def record(self, ids_buf, targets_buf, graph):
+    def record(self, ids_buf, targets_buf, graph, backward=True):
+        """Record the loss, and unless backward=False, every gradient.
+
+        backward=False is for evaluation: no gradient is written, so nothing an
+        optimiser or a GradAccum push reads afterwards is touched.
+        """
         K, TK = self.ctx.K, self.ctx.TK
         logits = self.forward(ids_buf, graph=graph)
         K["softmax_ce"]([logits, targets_buf, self.dlog16, self.dlog32, self.loss],
                         self.rows, self.pad_vocab, self.vocab, graph=graph)
+        if not backward:
+            return
         if self.tie:
             c, R, V, D = self.ctx, self.rows, self.pad_vocab, self.D
             # dh = dlogits @ tok

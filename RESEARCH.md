@@ -7,7 +7,8 @@ does not officially reach.
 
 It trains MNIST to 97.6% (5-run median, 97.51 to 97.71), trains a 10.8M-parameter transformer to a real loss
 curve in twelve minutes, fits and trains **315M parameters** in 7.3 GiB, and
-runs GPT-2 small's architecture at about 956 tokens/s. It needs no matrix units
+runs GPT-2 small's architecture at about 956 tokens/s and loads real GPT-2 checkpoints
+(`hf_gpt2.py`, `bench/RESULTS.md` section 50). It needs no matrix units
 (they are worth -5% to +18%, median about 8%), and its multi-device gradient exchange needs no
 NCCL.
 
@@ -806,6 +807,12 @@ loading, loss readback, held-out validation and checkpointing:
 loss 4.7821 -> 0.8717,  validation 0.9123
 ```
 
+(Corrected in `bench/RESULTS.md` section 52: that validation loss was measured by
+an evaluation that also ran AdamW on the validation batches. With forward-only
+evaluation, today's code ends this configuration at validation 1.0068 to 1.0351
+over three hash seeds, and trains to a higher loss than this run did, for reasons
+not separated. Validation 0.91 in 12 minutes does not stand.)
+
 No thermal decay: instantaneous throughput over the final six minutes (21,672)
 is above the cumulative average. The step-time extrapolation was about 7%
 optimistic.
@@ -836,14 +843,20 @@ pre-LayerNorm, GELU) is what this already builds:
 hours, 50M in 14.5 hours. Domain adaptation on a laptop is a matter of hours.
 
 (This headline read 1,117 tok/s until 2026-09-10, with 15 minutes / 2.5 hours /
-12.4 hours under it. That figure was cross-run: `bench/RESULTS.md` section 47 records
+12.4 hours under it. That figure was cross-run: `bench/RESULTS.md` section 46 records
 "the originally published 1,117 / 844 / 668 was again cross-run: batch 2 measures 956
 here". RESULTS.md was hedged at the time and this file was not, so the derived table
-stayed 17% optimistic in the document the README links as the write-up.)
+stayed 17% optimistic in the document the README links as the write-up. This note
+previously cited section 47 for that quote; it is in section 46.)
 
-(Measured with random weights. Loading real GPT-2 checkpoints would also need
-the weight file, a BPE tokenizer, and embedding/head weight tying, none of which
-is implemented. The throughput and memory are what a fine-tune would see.)
+(Measured with random weights and an untied head. This paragraph used to say that
+loading real GPT-2 checkpoints would need a weight file, a BPE tokenizer and
+embedding/head weight tying, none of them implemented. All three are now:
+`hf_gpt2.py` reads the `.safetensors` checkpoint with numpy, tiktoken's `gpt2`
+encoding is the tokenizer, and `GPT(tie=True)` ties the head. `bench/RESULTS.md`
+section 50 checks the loaded model against an independent numpy GPT-2. A tied model
+is faster than the untied one measured here, 926.5 against 807.4 tokens/s at seq 512
+batch 2 (section 51), so these figures are not what a GPT-2 fine-tune sees.)
 
 ### Batch size: throughput collapses at the memory ceiling
 
