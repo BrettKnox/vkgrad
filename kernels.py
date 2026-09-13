@@ -790,6 +790,42 @@ def make_kernels(dev):
         """,
         push=[("stride", "uint"), ("ncls", "uint")])
 
+    # Weighted softmax + cross entropy, for token-level loss masks. The gradient
+    # of row i is scaled by w[i] instead of 1/n, and loss[i] is the row's
+    # unweighted cross entropy. Rows with w == 0 skip the softmax and write
+    # zeros. A caller that wants the token mean over an optimiser step sets
+    # w = mask * S / (masked tokens in the step) and divides the summed gradient
+    # by S; S also keeps the f16 logit gradient clear of underflow. No f32
+    # gradient is written: nothing in the transformer reads one.
+    K["softmax_ce_w"] = Elementwise(
+        dev, "softmax_ce_w",
+        [("logits", "f32", "readonly"), ("labels", "u32", "readonly"),
+         ("w", "f32", "readonly"), ("dl16", "f16", "writeonly"),
+         ("loss", "f32", "writeonly")],
+        """
+        uint base = i * p.stride;
+        float wi = w[i];
+        if (wi == 0.0) {
+            for (uint c = 0u; c < p.stride; ++c) dl16[base + c] = float16_t(0.0);
+            loss[i] = 0.0;
+            return;
+        }
+        float mx = -1e30;
+        for (uint c = 0u; c < p.ncls; ++c) mx = max(mx, logits[base + c]);
+        float s = 0.0;
+        for (uint c = 0u; c < p.ncls; ++c) s += exp(logits[base + c] - mx);
+        float logZ = mx + log(s);
+        uint y = labels[i];
+        loss[i] = logZ - logits[base + y];
+        for (uint c = 0u; c < p.stride; ++c) {
+            float gv = 0.0;
+            if (c < p.ncls)
+                gv = (exp(logits[base + c] - logZ) - (c == y ? 1.0 : 0.0)) * wi;
+            dl16[base + c] = float16_t(gv);
+        }
+        """,
+        push=[("stride", "uint"), ("ncls", "uint")])
+
     # AdamW, fused: one pass reads w, g, m, v and writes w, m, v, and the f16
     # mirror the matmul consumes. Unfused this would be four passes over every
     # parameter, which at this ridge point can cost as much as the forward.

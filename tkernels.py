@@ -127,6 +127,39 @@ def make_transformer_kernels(dev):
         local=W, subgroup_size=RS, width=W,
         extensions=["GL_KHR_shader_subgroup_basic", "GL_KHR_shader_subgroup_arithmetic"])
 
+    # The same softmax for several samples packed into one row. seg[b*T + q] is
+    # the index where query q's sample starts, so the query sees keys
+    # seg..q only. Masked entries get P = 0, which makes attn_softmax_bwd's
+    # gradient zero there too, so backward needs no separate kernel.
+    # Each lane starts at its first index >= seg on its own stride.
+    K["attn_softmax_doc"] = Elementwise(
+        dev, "attn_softmax_doc",
+        [("s", "f32", "readonly"), ("seg", "u32", "readonly"),
+         ("p16", "f16", "writeonly")],
+        """
+        uint row = gl_WorkGroupID.x;
+        uint lane = gl_SubgroupInvocationID;
+        uint base = row * p.T;
+        uint q = row % p.T;
+        uint st = seg[(row / p.T / p.H) * p.T + q];
+        uint j0 = st + (lane + SUBWu - st % SUBWu) % SUBWu;
+        float mx = -1e30;
+        for (uint j = j0; j <= q; j += SUBWu) mx = max(mx, s[base + j] * p.scale);
+        mx = subgroupMax(mx);
+        float sum = 0.0;
+        for (uint j = j0; j <= q; j += SUBWu) sum += exp(s[base + j] * p.scale - mx);
+        sum = subgroupAdd(sum);
+        float inv = 1.0 / sum;
+        for (uint j = lane; j < p.T; j += SUBWu) {
+            float v = 0.0;
+            if (j >= st && j <= q) v = exp(s[base + j] * p.scale - mx) * inv;
+            p16[base + j] = float16_t(v);
+        }
+        """,
+        push=[("T", "uint"), ("H", "uint"), ("scale", "float")],
+        local=W, subgroup_size=RS, width=W,
+        extensions=["GL_KHR_shader_subgroup_basic", "GL_KHR_shader_subgroup_arithmetic"])
+
     # dS = P * (dP - sum_j dP_j P_j), same scale, same mask.
     # P is re-read in f16: attention probabilities live in [0, 1], where f16
     # carries ~1e-3 relative error, and not keeping an f32 copy removes a 4 MB
@@ -289,6 +322,36 @@ def make_transformer_kernels(dev):
         uint d = i % p.D;
         uint bt = i / p.D;
         uint t = bt % p.T;
+        float g = dx[i];
+        atomicAdd(dtok[ids[bt] * p.D + d], g);
+        atomicAdd(dpos[t * p.D + d], g);
+        """,
+        push=[("D", "uint"), ("T", "uint")],
+        extensions=["GL_EXT_shader_atomic_float"])
+
+    # Packed samples: positions restart at each sample's start, seg[bt], so a
+    # sample sees the positions it would alone. See attn_softmax_doc.
+    K["embed_doc"] = Elementwise(
+        dev, "embed_doc",
+        [("tok", "f32", "readonly"), ("pos", "f32", "readonly"),
+         ("ids", "u32", "readonly"), ("seg", "u32", "readonly"),
+         ("x", "f32", "writeonly")],
+        """
+        uint d = i % p.D;
+        uint bt = i / p.D;
+        uint t = bt % p.T - seg[bt];
+        x[i] = tok[ids[bt] * p.D + d] + pos[t * p.D + d];
+        """,
+        push=[("D", "uint"), ("T", "uint")])
+
+    K["embed_doc_bwd"] = Elementwise(
+        dev, "embed_doc_bwd",
+        [("dx", "f32", "readonly"), ("ids", "u32", "readonly"),
+         ("seg", "u32", "readonly"), ("dtok", "f32", ""), ("dpos", "f32", "")],
+        """
+        uint d = i % p.D;
+        uint bt = i / p.D;
+        uint t = bt % p.T - seg[bt];
         float g = dx[i];
         atomicAdd(dtok[ids[bt] * p.D + d], g);
         atomicAdd(dpos[t * p.D + d], g);

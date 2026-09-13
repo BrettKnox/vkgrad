@@ -134,7 +134,7 @@ class Attention:
         self.dv32 = ctx.buf(head * 4)
         self.dqkv16 = ctx.buf(self.rows * 3 * D * 2)
 
-    def forward(self, x16, graph=None):
+    def forward(self, x16, graph=None, seg=None):
         c, TK = self.ctx, self.ctx.TK
         T, hd, D, H = self.T, self.hd, self.D, self.H
         qkv = self.qkv.forward(x16, graph=graph)
@@ -144,8 +144,12 @@ class Attention:
         c.matmul(T, T, hd, trans_b=True, batched=True, nbatch=self.nbh)(
             self.q16, self.k16, self.scores, T, T, hd, graph=graph,
             nbatch=self.nbh, strides=(T * hd, T * hd, T * T))
-        TK["attn_softmax"]([self.scores, self.p16],
-                           self.nbh * T * c.dev.row_subgroup_size, T, self.scale, graph=graph)
+        n = self.nbh * T * c.dev.row_subgroup_size
+        if seg is None:
+            TK["attn_softmax"]([self.scores, self.p16], n, T, self.scale, graph=graph)
+        else:
+            TK["attn_softmax_doc"]([self.scores, seg, self.p16], n, T, H, self.scale,
+                                   graph=graph)
         c.matmul(T, hd, T, batched=True, nbatch=self.nbh)(
             self.p16, self.v16, self.ao32, T, hd, T, graph=graph,
             nbatch=self.nbh, strides=(T * T, T * hd, T * hd))
@@ -203,12 +207,12 @@ class Block:
         self.attn16 = ctx.buf(self.rows * D * 2)
         self.mlp16 = ctx.buf(self.rows * D * 2)
 
-    def forward(self, x32, graph=None):
+    def forward(self, x32, graph=None, seg=None):
         c, TK, K = self.ctx, self.ctx.TK, self.ctx.K
         n = self.rows * self.D
         self.x32 = x32
         h = self.ln1.forward(x32, graph=graph)
-        a = self.attn.forward(h, graph=graph)
+        a = self.attn.forward(h, graph=graph, seg=seg)
         TK["residual"]([a, self.attn.proj.b.w32, x32, self.res1], n, self.D, graph=graph)
 
         h2 = self.ln2.forward(self.res1, graph=graph)
@@ -291,57 +295,95 @@ class GPT:
     def n_params(self):
         return sum(p.n for p in self.params())
 
-    def forward(self, ids_buf, graph=None):
+    def n_stages(self):
+        return 2 * len(self.blocks) + 3
+
+    def forward(self, ids_buf, graph=None, seg=None):
+        """seg, optional (B*T,) u32: the index within its row where each token's
+        sample starts. Attention then stays inside a sample and positions
+        restart at 0 for each one, so samples packed into a row train as if
+        each ran alone. graph is a Graph or a stage -> Graph callable, see
+        record()."""
         TK = self.ctx.TK
-        TK["embed"]([self.tok.w32, self.pos.w32, ids_buf, self.x0],
-                    self.rows * self.D, self.D, self.T, graph=graph)
+        g = graph if callable(graph) else (lambda stage: graph)
+        if seg is None:
+            TK["embed"]([self.tok.w32, self.pos.w32, ids_buf, self.x0],
+                        self.rows * self.D, self.D, self.T, graph=g(0))
+        else:
+            TK["embed_doc"]([self.tok.w32, self.pos.w32, ids_buf, seg, self.x0],
+                            self.rows * self.D, self.D, self.T, graph=g(0))
         x = self.x0
-        for b in self.blocks:
-            x = b.forward(x, graph=graph)
-        h = self.lnf.forward(x, graph=graph)
+        for i, b in enumerate(self.blocks):
+            x = b.forward(x, graph=g(i), seg=seg)
+        L = len(self.blocks)
+        h = self.lnf.forward(x, graph=g(L))
         if not self.tie:
-            logits = self.head.forward(h, graph=graph)
+            logits = self.head.forward(h, graph=g(L))
             TK["add_bias"]([logits, self.head.b.w32], self.rows * self.pad_vocab,
-                           self.pad_vocab, graph=graph)
+                           self.pad_vocab, graph=g(L))
             return logits
         self.h16 = h
         R, V, D = self.rows, self.pad_vocab, self.D
         # logits = h @ tok^T; tok is stored V x D, hence trans_b.
         self.ctx.matmul(R, V, D, trans_b=True)(
-            h, self.tok.w16, self.logits, R, V, D, graph=graph)
+            h, self.tok.w16, self.logits, R, V, D, graph=g(L))
         return self.logits
 
-    def record(self, ids_buf, targets_buf, graph, backward=True):
+    def record(self, ids_buf, targets_buf, graph, backward=True, seg=None,
+               weights=None):
         """Record the loss, and unless backward=False, every gradient.
 
         backward=False is for evaluation: no gradient is written, so nothing an
         optimiser or a GradAccum push reads afterwards is touched.
+
+        graph is a Graph, or a callable stage -> Graph that spreads one step
+        over several submits, so no single submit runs long enough to trip the
+        display driver's watchdog. Stages, in execution order: i in 0..L-1 the
+        embedding (with stage 0) and block i forward; L the head and loss; L+1
+        the head's backward and lnf's; L+2+k block L-1-k backward; 2L+2 the
+        embedding backward. Submit the graphs in stage order.
+
+        seg: see forward(). weights, optional (B*T,) f32: per-row loss weights
+        in place of the 1/rows mean (kernel softmax_ce_w); the loss buffer then
+        holds each row's unweighted cross entropy, 0 where the weight is 0.
         """
         K, TK = self.ctx.K, self.ctx.TK
-        logits = self.forward(ids_buf, graph=graph)
-        K["softmax_ce"]([logits, targets_buf, self.dlog16, self.dlog32, self.loss],
-                        self.rows, self.pad_vocab, self.vocab, graph=graph)
+        g = graph if callable(graph) else (lambda stage: graph)
+        L = len(self.blocks)
+        logits = self.forward(ids_buf, graph=g, seg=seg)
+        if weights is None:
+            K["softmax_ce"]([logits, targets_buf, self.dlog16, self.dlog32, self.loss],
+                            self.rows, self.pad_vocab, self.vocab, graph=g(L))
+        else:
+            K["softmax_ce_w"]([logits, targets_buf, weights, self.dlog16, self.loss],
+                              self.rows, self.pad_vocab, self.vocab, graph=g(L))
         if not backward:
             return
+        gh = g(L + 1)
         if self.tie:
             c, R, V, D = self.ctx, self.rows, self.pad_vocab, self.D
             # dh = dlogits @ tok
-            c.matmul(R, D, V)(self.dlog16, self.tok.w16, self.dh32, R, D, V, graph=graph)
+            c.matmul(R, D, V)(self.dlog16, self.tok.w16, self.dh32, R, D, V, graph=gh)
             # The head's share of dtok = dlogits^T @ h. A matmul overwrites its
             # output, so this also replaces the zeroing before the scatter-add.
             c.matmul(V, D, R, trans_a=True)(
-                self.dlog16, self.h16, self.tok.g32, V, D, R, graph=graph)
+                self.dlog16, self.h16, self.tok.g32, V, D, R, graph=gh)
             d = self.dh32
         else:
-            d = self.head.backward(self.dlog16, need_dx=True, graph=graph)
+            d = self.head.backward(self.dlog16, need_dx=True, graph=gh)
             # Embedding gradients are a scatter-add, so they start at zero.
-            TK["col_sum_zero"]([self.tok.g32], self.tok.n, graph=graph)
-        d = self.lnf.backward(d, graph=graph)
-        for b in reversed(self.blocks):
-            d = b.backward(d, graph=graph)
-        TK["col_sum_zero"]([self.pos.g32], self.pos.n, graph=graph)
-        TK["embed_bwd"]([d, ids_buf, self.tok.g32, self.pos.g32],
-                        self.rows * self.D, self.D, self.T, graph=graph)
+            TK["col_sum_zero"]([self.tok.g32], self.tok.n, graph=gh)
+        d = self.lnf.backward(d, graph=gh)
+        for k, b in enumerate(reversed(self.blocks)):
+            d = b.backward(d, graph=g(L + 2 + k))
+        ge = g(2 * L + 2)
+        TK["col_sum_zero"]([self.pos.g32], self.pos.n, graph=ge)
+        if seg is None:
+            TK["embed_bwd"]([d, ids_buf, self.tok.g32, self.pos.g32],
+                            self.rows * self.D, self.D, self.T, graph=ge)
+        else:
+            TK["embed_doc_bwd"]([d, ids_buf, seg, self.tok.g32, self.pos.g32],
+                                self.rows * self.D, self.D, self.T, graph=ge)
 
     def read_loss(self):
         self.loss.invalidate()

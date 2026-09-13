@@ -35,14 +35,26 @@ def layernorm_bwd(dy, xh, r, g, D):
     return dx, (dy * xh).sum(0), dy.sum(0)
 
 
-def np_model(P, ids, targets, B, T, D, H, n_layer, vocab, pad_vocab):
-    """Forward and backward for the same architecture, in f32 numpy."""
+def np_model(P, ids, targets, B, T, D, H, n_layer, vocab, pad_vocab, seg=None,
+             weights=None):
+    """Forward and backward for the same architecture, in f32 numpy.
+
+    seg (B*T,): where each token's sample starts in its row. Attention is then
+    limited to the token's own sample and positions count from that start.
+    weights (B*T,): the loss is sum(w * ce) instead of the mean.
+    """
     hd = D // H
     rows = B * T
     scale = 1.0 / np.sqrt(hd)
     cache = {}
 
-    x = P["tok"][ids] + np.tile(P["pos"], (B, 1))
+    t_idx = np.arange(rows) % T
+    posidx = t_idx if seg is None else t_idx - seg.astype(np.int64)
+    mask = np.tril(np.ones((T, T), bool))
+    if seg is not None:
+        mask = mask[None, None] & (np.arange(T)[None, None, None, :]
+                                   >= seg.reshape(B, 1, T, 1))
+    x = P["tok"][ids] + P["pos"][posidx]
     cache["x0"] = x
     for l in range(n_layer):
         p = P[f"b{l}"]
@@ -51,7 +63,6 @@ def np_model(P, ids, targets, B, T, D, H, n_layer, vocab, pad_vocab):
         q, k, v = (qkv[:, i * D:(i + 1) * D].reshape(B, T, H, hd).transpose(0, 2, 1, 3)
                    for i in range(3))
         s = (q @ k.transpose(0, 1, 3, 2)) * scale
-        mask = np.tril(np.ones((T, T), bool))
         s = np.where(mask, s, -1e30)
         s = s - s.max(-1, keepdims=True)
         e = np.exp(s) * mask
@@ -77,13 +88,18 @@ def np_model(P, ids, targets, B, T, D, H, n_layer, vocab, pad_vocab):
     valid = logits[:, :vocab]
     mx = valid.max(1, keepdims=True)
     lse = mx + np.log(np.exp(valid - mx).sum(1, keepdims=True))
-    loss = float((lse[:, 0] - valid[np.arange(rows), targets]).mean())
+    ce = lse[:, 0] - valid[np.arange(rows), targets]
 
     dlogits = np.zeros_like(logits)
     probs = np.exp(valid - lse)
     oh = np.zeros_like(valid)
     oh[np.arange(rows), targets] = 1.0
-    dlogits[:, :vocab] = (probs - oh) / rows
+    if weights is None:
+        loss = float(ce.mean())
+        dlogits[:, :vocab] = (probs - oh) / rows
+    else:
+        loss = float((ce * weights).sum())
+        dlogits[:, :vocab] = (probs - oh) * weights[:, None]
 
     G = {}
     G["head.W"] = hf.T @ dlogits
@@ -128,7 +144,8 @@ def np_model(P, ids, targets, B, T, D, H, n_layer, vocab, pad_vocab):
         d = dres1 + dx_attn
         G[f"b{l}"] = g
 
-    G["pos"] = d.reshape(B, T, D).sum(0)
+    G["pos"] = np.zeros_like(P["pos"])
+    np.add.at(G["pos"], posidx, d)
     G["tok"] = np.zeros_like(P["tok"])
     np.add.at(G["tok"], ids, d)
     return loss, G
@@ -158,6 +175,50 @@ def relerr(a, b):
     return float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-8))
 
 
+def shared(ctx, arr):
+    buf = ctx.buf(arr.nbytes, "shared")
+    buf.array(arr.dtype, arr.shape)[:] = arr
+    buf.flush()
+    return buf
+
+
+def check_grads(model, G, tie):
+    checks = [("lnf.g", model.lnf.g, G["lnf.g"]),
+              ("lnf.b", model.lnf.b, G["lnf.b"]),
+              ("pos", model.pos, G["pos"])]
+    if tie:
+        # The embedding's gradient is the lookup's plus the head's.
+        checks.append(("tok", model.tok, G["tok"] + G["head.W"].T))
+    else:
+        checks += [("head.W", model.head.W, G["head.W"]),
+                   ("head.b", model.head.b, G["head.b"]),
+                   ("tok", model.tok, G["tok"][:model.pad_vocab])]
+    for i, b in enumerate(model.blocks):
+        g = G[f"b{i}"]
+        checks += [(f"b{i}.fc2.W", b.fc2.W, g["fc2.W"]),
+                   (f"b{i}.fc1.W", b.fc1.W, g["fc1.W"]),
+                   (f"b{i}.ln2.g", b.ln2.g, g["ln2.g"]),
+                   (f"b{i}.proj.W", b.attn.proj.W, g["proj.W"]),
+                   (f"b{i}.qkv.W", b.attn.qkv.W, g["qkv.W"]),
+                   (f"b{i}.qkv.b", b.attn.qkv.b, g["qkv.b"]),
+                   (f"b{i}.ln1.g", b.ln1.g, g["ln1.g"])]
+
+    worst = 0.0
+    bad = []
+    for name, param, ref in checks:
+        got = param.grad_numpy()
+        if ref.shape != got.shape:
+            ref = ref.reshape(got.shape)
+        e = relerr(got, ref)
+        worst = max(worst, e)
+        flag = "OK " if e < 3e-2 else "BAD"
+        if e >= 3e-2:
+            bad.append((name, e))
+        print(f"  {name:14s} rel err {e:.2e}  {flag}")
+    assert not bad, f"gradients wrong: {bad}"
+    print(f"  all {len(checks)} gradient tensors match, worst {worst:.2e}")
+
+
 def run(dev, tie):
     B, T, D, H, n_layer, vocab = 2, 16, 32, 2, 2, 16
     print(f"\n  tie={tie}")
@@ -180,12 +241,7 @@ def run(dev, tie):
                 s = 1.0 if p.name == "head.b" else 0.1
                 p.set((rb.standard_normal(p.shape) * s).astype(np.float32))
 
-        idb = ctx.buf(rows * 4, "shared")
-        idb.array(np.uint32, (rows,))[:] = ids
-        idb.flush()
-        tgb = ctx.buf(rows * 4, "shared")
-        tgb.array(np.uint32, (rows,))[:] = tgt
-        tgb.flush()
+        idb, tgb = shared(ctx, ids), shared(ctx, tgt)
 
         P = extract(model, n_layer)
         graph = dev.graph("test")
@@ -201,41 +257,76 @@ def run(dev, tie):
         e = abs(loss - ref_loss) / abs(ref_loss)
         assert e < 5e-3, f"loss {loss} vs numpy {ref_loss} (rel {e:.2e})"
         print(f"  loss {loss:.6f} vs numpy {ref_loss:.6f}   rel {e:.1e}   OK")
+        check_grads(model, G, tie)
+    finally:
+        ctx.destroy()
 
-        checks = [("lnf.g", model.lnf.g, G["lnf.g"]),
-                  ("lnf.b", model.lnf.b, G["lnf.b"]),
-                  ("pos", model.pos, G["pos"])]
-        if tie:
-            # The embedding's gradient is the lookup's plus the head's.
-            checks.append(("tok", model.tok, G["tok"] + G["head.W"].T))
-        else:
-            checks += [("head.W", model.head.W, G["head.W"]),
-                       ("head.b", model.head.b, G["head.b"]),
-                       ("tok", model.tok, G["tok"][:model.pad_vocab])]
-        for i, b in enumerate(model.blocks):
-            g = G[f"b{i}"]
-            checks += [(f"b{i}.fc2.W", b.fc2.W, g["fc2.W"]),
-                       (f"b{i}.fc1.W", b.fc1.W, g["fc1.W"]),
-                       (f"b{i}.ln2.g", b.ln2.g, g["ln2.g"]),
-                       (f"b{i}.proj.W", b.attn.proj.W, g["proj.W"]),
-                       (f"b{i}.qkv.W", b.attn.qkv.W, g["qkv.W"]),
-                       (f"b{i}.qkv.b", b.attn.qkv.b, g["qkv.b"]),
-                       (f"b{i}.ln1.g", b.ln1.g, g["ln1.g"])]
 
-        worst = 0.0
-        bad = []
-        for name, param, ref in checks:
-            got = param.grad_numpy()
-            if ref.shape != got.shape:
-                ref = ref.reshape(got.shape)
-            e = relerr(got, ref)
-            worst = max(worst, e)
-            flag = "OK " if e < 3e-2 else "BAD"
-            if e >= 3e-2:
-                bad.append((name, e))
-            print(f"  {name:14s} rel err {e:.2e}  {flag}")
-        assert not bad, f"gradients wrong: {bad}"
-        print(f"  all {len(checks)} gradient tensors match, worst {worst:.2e}")
+def run_packed(dev):
+    """Samples packed into rows (seg), per-row loss weights, and the step
+    spread over one graph per stage, all at once against numpy.
+
+    T is twice the 32-wide subgroup, and samples start mid-lane, so the
+    attention kernel's per-lane start is exercised. The same GPU result is also
+    compared with a numpy model that ignores seg, to show the check can fail.
+    """
+    B, T, D, H, n_layer, vocab = 2, 64, 32, 2, 2, 16
+    rows = B * T
+    print("\n  packed samples: seg + loss weights + one graph per stage, tie=True")
+    ctx = TCtx(dev)
+    try:
+        model = GPT(ctx, B, T, D, H, n_layer, vocab, tie=True)
+        rng = np.random.default_rng(0)
+        ids = rng.integers(0, vocab, rows).astype(np.uint32)
+        tgt = rng.integers(0, vocab, rows).astype(np.uint32)
+        seg = np.zeros(rows, np.uint32)
+        for b, starts in enumerate(((0, 23, 40, 57), (0, 5, 33))):
+            for s, e in zip(starts, starts[1:] + (T,)):
+                seg[b * T + s:b * T + e] = s
+        w = rng.uniform(0.5, 2.0, rows).astype(np.float32)
+        w[rng.random(rows) < 0.3] = 0.0
+        rb = np.random.default_rng(1)
+        for p in model.params():
+            if p.name.endswith(".b"):
+                p.set((rb.standard_normal(p.shape) * 0.1).astype(np.float32))
+        idb, tgb, segb, wb = (shared(ctx, a) for a in (ids, tgt, seg, w))
+
+        P = extract(model, n_layer)
+        graphs = {}
+
+        def stage(s):
+            if s not in graphs:
+                graphs[s] = dev.graph(f"stage{s}")
+            return graphs[s]
+
+        model.record(idb, tgb, stage, seg=segb, weights=wb)
+        assert sorted(graphs) == list(range(model.n_stages())), sorted(graphs)
+        for s in sorted(graphs):
+            graphs[s].finish()
+            graphs[s].submit()
+        print(f"  {len(graphs)} graphs, "
+              f"{sum(g.n_dispatch for g in graphs.values())} dispatches")
+        model.loss.invalidate()
+        per_row = model.loss.array(np.float32, (rows,))
+        assert not per_row[w == 0].any(), "rows with weight 0 must report loss 0"
+        loss = float((per_row * w).sum())
+
+        ref_loss, G = np_model(P, ids, tgt, B, T, D, H, n_layer, vocab,
+                               model.pad_vocab, seg=seg, weights=w)
+        e = abs(loss - ref_loss) / abs(ref_loss)
+        assert e < 5e-3, f"loss {loss} vs numpy {ref_loss} (rel {e:.2e})"
+        print(f"  loss {loss:.6f} vs numpy {ref_loss:.6f}   rel {e:.1e}   OK")
+        check_grads(model, G, True)
+        # The loss barely depends on seg at this init (3.2e-3 relative when seg was
+        # ignored), so show the check can fail on the gradients, which do.
+        _, Gp = np_model(P, ids, tgt, B, T, D, H, n_layer, vocab, model.pad_vocab,
+                         weights=w)
+        worst = max(relerr(model.pos.grad_numpy(), Gp["pos"]),
+                    relerr(model.blocks[0].attn.qkv.W.grad_numpy(), Gp["b0"]["qkv.W"]))
+        assert worst > 10 * 3e-2, \
+            f"the check cannot tell packed samples from one sequence ({worst:.2e})"
+        print(f"  against numpy ignoring seg, pos or b0.qkv.W is off by {worst:.2e}: "
+              f"the check can fail")
     finally:
         ctx.destroy()
 
@@ -246,6 +337,7 @@ def main():
     try:
         for tie in (False, True):
             run(dev, tie)
+        run_packed(dev)
         print("\ntransformer checks passed")
     finally:
         dev.destroy()
