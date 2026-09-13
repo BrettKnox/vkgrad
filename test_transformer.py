@@ -136,8 +136,13 @@ def np_model(P, ids, targets, B, T, D, H, n_layer, vocab, pad_vocab):
 
 def extract(model, n_layer):
     P = {"tok": model.tok.numpy().copy(), "pos": model.pos.numpy().copy(),
-         "lnf.g": model.lnf.g.numpy().copy(), "lnf.b": model.lnf.b.numpy().copy(),
-         "head.W": model.head.W.numpy().copy(), "head.b": model.head.b.numpy().copy()}
+         "lnf.g": model.lnf.g.numpy().copy(), "lnf.b": model.lnf.b.numpy().copy()}
+    if model.tie:
+        P["head.W"] = P["tok"].T.copy()
+        P["head.b"] = np.zeros(model.pad_vocab, np.float32)
+    else:
+        P["head.W"] = model.head.W.numpy().copy()
+        P["head.b"] = model.head.b.numpy().copy()
     for i, b in enumerate(model.blocks):
         P[f"b{i}"] = {
             "ln1.g": b.ln1.g.numpy().copy(), "ln1.b": b.ln1.b.numpy().copy(),
@@ -153,17 +158,23 @@ def relerr(a, b):
     return float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-8))
 
 
-def main():
+def run(dev, tie):
     B, T, D, H, n_layer, vocab = 2, 16, 32, 2, 2, 16
-    dev = Device()
-    print(dev)
+    print(f"\n  tie={tie}")
     ctx = TCtx(dev)
     try:
-        model = GPT(ctx, B, T, D, H, n_layer, vocab)
+        model = GPT(ctx, B, T, D, H, n_layer, vocab, tie=tie)
         rows = B * T
         rng = np.random.default_rng(0)
         ids = rng.integers(0, vocab, rows).astype(np.uint32)
         tgt = rng.integers(0, vocab, rows).astype(np.uint32)
+        # Nonzero biases. At their zero init, a bias that forward never adds
+        # still passes every check here; the qkv bias did exactly that. head.b
+        # stays zero because forward does not apply it (see GPT).
+        rb = np.random.default_rng(1)
+        for p in model.params():
+            if p.name.endswith(".b") and p.name != "head.b":
+                p.set((rb.standard_normal(p.shape) * 0.1).astype(np.float32))
 
         idb = ctx.buf(rows * 4, "shared")
         idb.array(np.uint32, (rows,))[:] = ids
@@ -187,12 +198,16 @@ def main():
         assert e < 5e-3, f"loss {loss} vs numpy {ref_loss} (rel {e:.2e})"
         print(f"  loss {loss:.6f} vs numpy {ref_loss:.6f}   rel {e:.1e}   OK")
 
-        checks = [("head.W", model.head.W, G["head.W"]),
-                  ("head.b", model.head.b, G["head.b"]),
-                  ("lnf.g", model.lnf.g, G["lnf.g"]),
+        checks = [("lnf.g", model.lnf.g, G["lnf.g"]),
                   ("lnf.b", model.lnf.b, G["lnf.b"]),
-                  ("pos", model.pos, G["pos"]),
-                  ("tok", model.tok, G["tok"][:model.pad_vocab])]
+                  ("pos", model.pos, G["pos"])]
+        if tie:
+            # The embedding's gradient is the lookup's plus the head's.
+            checks.append(("tok", model.tok, G["tok"] + G["head.W"].T))
+        else:
+            checks += [("head.W", model.head.W, G["head.W"]),
+                       ("head.b", model.head.b, G["head.b"]),
+                       ("tok", model.tok, G["tok"][:model.pad_vocab])]
         for i, b in enumerate(model.blocks):
             g = G[f"b{i}"]
             checks += [(f"b{i}.fc2.W", b.fc2.W, g["fc2.W"]),
@@ -216,10 +231,19 @@ def main():
                 bad.append((name, e))
             print(f"  {name:14s} rel err {e:.2e}  {flag}")
         assert not bad, f"gradients wrong: {bad}"
-        print(f"\n  all {len(checks)} gradient tensors match, worst {worst:.2e}")
-        print("transformer checks passed")
+        print(f"  all {len(checks)} gradient tensors match, worst {worst:.2e}")
     finally:
         ctx.destroy()
+
+
+def main():
+    dev = Device()
+    print(dev)
+    try:
+        for tie in (False, True):
+            run(dev, tie)
+        print("\ntransformer checks passed")
+    finally:
         dev.destroy()
 
 

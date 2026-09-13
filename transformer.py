@@ -138,7 +138,7 @@ class Attention:
         c, TK = self.ctx, self.ctx.TK
         T, hd, D, H = self.T, self.hd, self.D, self.H
         qkv = self.qkv.forward(x16, graph=graph)
-        TK["split_qkv"]([qkv, self.q16, self.k16, self.v16],
+        TK["split_qkv"]([qkv, self.qkv.b.w32, self.q16, self.k16, self.v16],
                         self.rows * D, D, T, H, hd, graph=graph)
         # scores = Q @ K^T, one batched dispatch over every (batch, head).
         c.matmul(T, T, hd, trans_b=True, batched=True, nbatch=self.nbh)(
@@ -247,7 +247,7 @@ class Block:
 
 
 class GPT:
-    def __init__(self, ctx, B, T, D, H, n_layer, vocab, pad_vocab=None):
+    def __init__(self, ctx, B, T, D, H, n_layer, vocab, pad_vocab=None, tie=False):
         self.ctx, self.B, self.T, self.D = ctx, B, T, D
         self.rows = B * T
         self.vocab = vocab
@@ -262,7 +262,16 @@ class GPT:
         self.x0 = ctx.buf(self.rows * D * 4)
         self.blocks = [Block(ctx, B, T, D, H, f"b{i}") for i in range(n_layer)]
         self.lnf = LayerNorm(ctx, self.rows, D, "lnf")
-        self.head = Dense(ctx, self.rows, D, self.pad_vocab, "head", scale=0.02)
+        # tie=True: the head is the token embedding transposed, as in GPT-2.
+        # Drops pad_vocab*D parameters (38.6M at GPT-2's vocabulary) with their
+        # gradients and Adam moments. Untied, the head's bias is computed a
+        # gradient but never added in forward.
+        self.tie = tie
+        if tie:
+            self.logits = ctx.buf(self.rows * self.pad_vocab * 4)
+            self.dh32 = ctx.buf(self.rows * D * 4)
+        else:
+            self.head = Dense(ctx, self.rows, D, self.pad_vocab, "head", scale=0.02)
 
         self.dlog16 = ctx.buf(self.rows * self.pad_vocab * 2)
         self.dlog32 = ctx.buf(self.rows * self.pad_vocab * 4)
@@ -275,8 +284,9 @@ class GPT:
             yield from b.params()
         yield self.lnf.g
         yield self.lnf.b
-        yield self.head.W
-        yield self.head.b
+        if not self.tie:
+            yield self.head.W
+            yield self.head.b
 
     def n_params(self):
         return sum(p.n for p in self.params())
@@ -289,20 +299,36 @@ class GPT:
         for b in self.blocks:
             x = b.forward(x, graph=graph)
         h = self.lnf.forward(x, graph=graph)
-        return self.head.forward(h, graph=graph)
+        if not self.tie:
+            return self.head.forward(h, graph=graph)
+        self.h16 = h
+        R, V, D = self.rows, self.pad_vocab, self.D
+        # logits = h @ tok^T; tok is stored V x D, hence trans_b.
+        self.ctx.matmul(R, V, D, trans_b=True)(
+            h, self.tok.w16, self.logits, R, V, D, graph=graph)
+        return self.logits
 
     def record(self, ids_buf, targets_buf, graph):
         K, TK = self.ctx.K, self.ctx.TK
         logits = self.forward(ids_buf, graph=graph)
         K["softmax_ce"]([logits, targets_buf, self.dlog16, self.dlog32, self.loss],
                         self.rows, self.pad_vocab, self.vocab, graph=graph)
-        d = self.head.backward(self.dlog16, need_dx=True, graph=graph)
+        if self.tie:
+            c, R, V, D = self.ctx, self.rows, self.pad_vocab, self.D
+            # dh = dlogits @ tok
+            c.matmul(R, D, V)(self.dlog16, self.tok.w16, self.dh32, R, D, V, graph=graph)
+            # The head's share of dtok = dlogits^T @ h. A matmul overwrites its
+            # output, so this also replaces the zeroing before the scatter-add.
+            c.matmul(V, D, R, trans_a=True)(
+                self.dlog16, self.h16, self.tok.g32, V, D, R, graph=graph)
+            d = self.dh32
+        else:
+            d = self.head.backward(self.dlog16, need_dx=True, graph=graph)
+            # Embedding gradients are a scatter-add, so they start at zero.
+            TK["col_sum_zero"]([self.tok.g32], self.tok.n, graph=graph)
         d = self.lnf.backward(d, graph=graph)
         for b in reversed(self.blocks):
             d = b.backward(d, graph=graph)
-        # Embedding gradients are a scatter-add, so the buffers must start at
-        # zero every step.
-        TK["col_sum_zero"]([self.tok.g32], self.tok.n, graph=graph)
         TK["col_sum_zero"]([self.pos.g32], self.pos.n, graph=graph)
         TK["embed_bwd"]([d, ids_buf, self.tok.g32, self.pos.g32],
                         self.rows * self.D, self.D, self.T, graph=graph)

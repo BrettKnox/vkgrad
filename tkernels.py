@@ -156,10 +156,13 @@ def make_transformer_kernels(dev):
 
     # ---- Head permutes ---------------------------------------------------
     # (B*T, 3D) -> three (B*H, T, hd) f16 tensors. Fused: one pass over the
-    # fused QKV projection produces all three attention operands.
+    # fused QKV projection adds its bias and produces all three attention
+    # operands. The bias add used to be missing, invisible while biases were
+    # zero and wrong for any pretrained checkpoint.
     K["split_qkv"] = Elementwise(
         dev, "split_qkv",
-        [("qkv", "f32", "readonly"), ("q16", "f16", "writeonly"),
+        [("qkv", "f32", "readonly"), ("bias", "f32", "readonly"),
+         ("q16", "f16", "writeonly"),
          ("k16", "f16", "writeonly"), ("v16", "f16", "writeonly")],
         """
         uint d = i % p.D;
@@ -170,9 +173,9 @@ def make_transformer_kernels(dev):
         uint j = d % p.hd;
         uint dst = ((b * p.H + h) * p.T + t) * p.hd + j;
         uint src = bt * 3u * p.D + d;
-        q16[dst] = float16_t(qkv[src]);
-        k16[dst] = float16_t(qkv[src + p.D]);
-        v16[dst] = float16_t(qkv[src + 2u * p.D]);
+        q16[dst] = float16_t(qkv[src] + bias[d]);
+        k16[dst] = float16_t(qkv[src + p.D] + bias[d + p.D]);
+        v16[dst] = float16_t(qkv[src + 2u * p.D] + bias[d + 2u * p.D]);
         """,
         push=[("D", "uint"), ("T", "uint"), ("H", "uint"), ("hd", "uint")])
 
