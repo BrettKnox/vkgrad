@@ -1191,6 +1191,11 @@ loading is not written.
 
 ## 44. Gradient accumulation helps large models and hurts small ones
 
+**Checked 2026-09-14, unaffected by section 52:** both rows came from inline
+`python -c` scripts, not in the repo, that fed random token ids to the training
+graphs alone and kept the best of 3 steps after 2 warmups, so `train_lm.py`'s
+`evaluate()` never ran and this section reports no loss.
+
 Section 43 found throughput falling as batch grows, which suggested a large
 effective batch should be assembled from small microbatches. Accumulation is
 the same primitive as the multi-device collective from section 32, with workers

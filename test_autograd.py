@@ -59,6 +59,12 @@ def build(dev, batch=16, n_in=32, n_hid=16, n_cls=4, pad=16, seed=0):
     # exactly the same numbers and precision is not what we are testing.
     x = rng.standard_normal((batch, n_in)).astype(np.float16).astype(np.float32)
     y = rng.integers(0, n_cls, batch).astype(np.uint32)
+    # Linear initialises from hash(name), which Python randomises per process,
+    # so redraw every parameter from the seed: a failure then reproduces at
+    # any PYTHONHASHSEED. Biases are nonzero so the forward bias add is tested.
+    for p in model.params():
+        std = np.sqrt(2.0 / p.shape[0]) if len(p.shape) == 2 else 0.1
+        p.set(rng.standard_normal(p.shape).astype(np.float32) * std)
 
     xb = ctx.buf(batch * n_in * 2, "shared")
     xb.array(np.float16, (batch, n_in))[:] = x.astype(np.float16)
@@ -97,34 +103,48 @@ def test_gradients(dev):
         ctx.destroy()
 
 
-def test_finite_differences(dev):
-    """Independent of the numpy reference: perturb a weight, watch the loss."""
-    batch, n_in, n_hid, n_cls, pad = 16, 32, 16, 4, 16
-    ctx, model, xb, yb, x, y = build(dev, batch, n_in, n_hid, n_cls, pad, seed=3)
-    try:
-        head = model.layers[-1]
-        model.forward_backward(xb, yb)
-        grad = head.W.grad_numpy()
-        W = head.W.numpy().copy()
+def test_finite_differences(dev, seed=3):
+    """Perturb a weight, watch the loss, compare with the GPU's gradient.
 
-        rng = np.random.default_rng(1)
-        picks = [(int(rng.integers(0, n_hid)), int(rng.integers(0, n_cls)))
-                 for _ in range(4)]
-        eps = 0.05  # large: the forward runs through f16 activations
+    eps is large because the loss comes through f16 activations (at 0.02 the
+    rounding more than doubles the worst error), and a central difference at
+    0.05 is off by O(eps^2) in absolute terms: relative to a near-zero gradient
+    that is unbounded, so 4 head.W entries picked at random failed for about 2%
+    of inits. Each tensor's two largest entries are checked instead, ranked by the
+    float64 numpy reference rather than by the GPU's own gradient, so a bug that
+    zeroes or shrinks a gradient cannot steer the check away from it. The
+    verdict compares the GPU gradient with the finite difference only; the
+    reference picks the entries and scales the error.
+    """
+    batch, n_in, n_hid, n_cls, pad = 16, 32, 16, 4, 16
+    ctx, model, xb, yb, x, y = build(dev, batch, n_in, n_hid, n_cls, pad, seed=seed)
+    try:
+        params = list(model.params())      # fc0.W, fc0.b, head.W, head.b
+        w64 = [p.numpy().astype(np.float64) for p in params]
+        refs = numpy_forward_backward(x.astype(np.float64), *w64, y, n_cls)[1:]
+        model.forward_backward(xb, yb)
+        # Read them all now: every perturbed forward_backward overwrites them.
+        grads = [p.grad_numpy() for p in params]
+        eps = 0.05
         worst = 0.0
-        for (i, j) in picks:
-            Wp = W.copy(); Wp[i, j] += eps
-            head.W.set(Wp)
-            lp = model.forward_backward(xb, yb)
-            Wm = W.copy(); Wm[i, j] -= eps
-            head.W.set(Wm)
-            lm = model.forward_backward(xb, yb)
-            head.W.set(W)
-            fd = (lp - lm) / (2 * eps)
-            e = abs(fd - grad[i, j]) / max(abs(grad[i, j]), 1e-4)
-            worst = max(worst, e)
-            assert e < 0.05, f"W[{i},{j}]: finite diff {fd:.6f} vs grad {grad[i, j]:.6f}"
-        print(f"  finite differences (4 entries) worst rel err {worst:.2e}   OK")
+        for p, ref, grad in zip(params, refs, grads):
+            w = p.numpy().copy()
+            for flat in np.argsort(-np.abs(ref).ravel())[:2]:
+                i = np.unravel_index(flat, ref.shape)
+                wp = w.copy(); wp[i] += eps
+                p.set(wp)
+                lp = model.forward_backward(xb, yb)
+                wm = w.copy(); wm[i] -= eps
+                p.set(wm)
+                lm = model.forward_backward(xb, yb)
+                p.set(w)
+                fd = (lp - lm) / (2 * eps)
+                e = abs(fd - float(grad[i])) / abs(ref[i])
+                worst = max(worst, e)
+                assert e < 0.05, (f"{p.name}{tuple(int(k) for k in i)}: finite diff "
+                                  f"{fd:.6f} vs grad {grad[i]:.6f}, rel err {e:.3e}")
+        print(f"  finite differences (8 entries) worst rel err {worst:.2e}   OK")
+        return worst
     finally:
         ctx.destroy()
 
