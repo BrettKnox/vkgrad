@@ -893,7 +893,7 @@ Verification, all against independent numpy implementations:
 | matmul, 5 shapes and both backward transposes | ~1e-06 |
 | f32 accumulation over K=1024 | exact |
 | MLP gradients vs numpy | 4e-04 |
-| MLP finite differences | 2e-03 |
+| MLP finite differences, 5 inits | worst 6.6e-03 |
 | transformer loss vs numpy | 2.2e-05 |
 | transformer, all 20 gradient tensors | worst 3.0e-03 |
 

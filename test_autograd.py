@@ -171,7 +171,10 @@ def main():
     print(dev)
     try:
         test_gradients(dev)
-        test_finite_differences(dev)
+        # Several inits: a bug shared with the numpy reference (fc0's GELU'
+        # taken at x @ W, before the bias) passes at seed 3 and fails at 2 and 4.
+        for seed in range(5):
+            test_finite_differences(dev, seed)
         test_adamw_decreases_loss(dev)
         print("\nall autograd checks passed")
     finally:
